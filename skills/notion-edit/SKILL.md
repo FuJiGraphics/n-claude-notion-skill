@@ -17,11 +17,20 @@ description: >-
 Block-level edit/delete, allowlist-guarded. Engine:
 `~/.claude/skills/notion-read/scripts/notion_api.py`.
 
-Notion pages are block trees, not text files — there is no old_string →
-new_string. You locate the block by id, then operate on it. The explicitness
-is a feature: you always see exactly what you're about to change.
+Notion pages are block trees, not text files — but `edit-str` gives you the
+old_string → new_string feel when the target text lives inside one block:
 
-## Workflow
+```bash
+python3 ~/.claude/skills/notion-read/scripts/notion_api.py \
+  edit-str '<page-url-or-id>' --old '<기존 문자열>' --new '<새 문자열>' [--all]
+```
+
+It matches against the markdown form that `read` prints (so copy old strings
+straight from a read). Multiple matches stop with a block list — pick one via
+the id workflow below, or pass `--all`. Strings spanning multiple blocks can't
+be replaced in one go (Notion 구조 제약) — fall back to block-level editing.
+
+## Block-id workflow (when edit-str isn't enough)
 
 1. **Read the page with ids** to find the target block:
 

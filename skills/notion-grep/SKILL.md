@@ -11,29 +11,24 @@ description: >-
 
 # Notion Grep
 
-Find which Notion pages mention a keyword. Two layers, run BOTH:
+Find which Notion pages mention a keyword. One command runs both layers:
 
-1. **Full-text over the local cache** — pages previously read by `/notion-read`
-   or mirrored by `sync`:
+```bash
+python3 ~/.claude/skills/notion-read/scripts/notion_api.py search '<query>'
+```
 
-   ```bash
-   rg -i -l --no-messages '<query>' ~/.claude/notion/cache/
-   ```
+Output has two sections:
+- `== 제목 매칭 ==` — official API title search (catches uncached pages; the
+  API only searches TITLES — a Notion API limitation, not a bug).
+- `== 본문 매칭 ==` — full-text over the local cache (`~/.claude/notion/cache/`,
+  pages previously read or mirrored by `sync`), with matching snippets and the
+  `fetched_at` freshness stamp.
 
-   For each hit, pull context and identify the page:
+For regex or context-heavy digging, `rg` directly on the cache still works:
 
-   ```bash
-   rg -i -n -C1 '<query>' <hit-file>
-   head -5 <hit-file>   # frontmatter: title, url, fetched_at
-   ```
-
-2. **Title search via the official API** (catches pages not yet cached — but
-   the API only searches TITLES, not body text; that is a Notion API
-   limitation, not a bug):
-
-   ```bash
-   python3 ~/.claude/skills/notion-read/scripts/notion_api.py search '<query>'
-   ```
+```bash
+rg -i -n -C1 '<query>' ~/.claude/notion/cache/
+```
 
 ## Report
 

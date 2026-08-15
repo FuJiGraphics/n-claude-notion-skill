@@ -53,7 +53,21 @@ a top-level page covers all its sub-pages).
    `edited` sort by timestamps; `--filter-json <file>` is the escape hatch for
    anything fancier (or/date-range/relation). Multi-source DBs: pick one with
    `--source <이름|id>`. **Pages that are DB rows** render their properties
-   (status, assignee, dates...) in a `**속성**` block before the body.
+   (status, assignee, dates...) in a `**속성**` block before the body, and every
+   page/DB read starts with a `경로:` breadcrumb (ancestor chain) so same-named
+   docs are distinguishable.
+
+   **Aggregations / joins** — when filters aren't enough (counts, averages,
+   cross-DB joins), run read-only SQL over the rows locally:
+
+   ```bash
+   ... sql 'SELECT 상태, COUNT(*) FROM t GROUP BY 상태' --db '<db-url>'
+   ... sql 'SELECT ... FROM t1 JOIN t2 ON ...' --db '<db1>' --db '<db2>'
+   ```
+
+   Tables are `t` (single) or `t1, t2, ...`; columns = property names + `id`,
+   `url`. Dates are start-date strings, checkboxes 0/1. The SQLite copy is
+   query-only — writes are rejected.
 
 2. **Read the markdown file.** Read `<scratchpad>/notion_page.md`.
 

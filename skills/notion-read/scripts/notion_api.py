@@ -37,7 +37,16 @@ OAuth 앱 자격증명 (팀 관리자가 1회 등록, 사내 채널로 배포):
     edit <block_id> --text '<새 내용>'
                       블록 본문 교체 (allowlist 하위만, 타입 유지)
     delete <block_id> 블록 archive (Notion 휴지통 복구 가능, allowlist 하위만)
-    search <query>    공식 /v1/search - 제목만 검색된다(본문 미지원, API 제약)
+    search <query>    2층 검색: 공식 /v1/search 제목 매칭 + 로컬 캐시 본문 매칭
+                      (본문층은 sync 로 만든 캐시 기준 - fetched_at 시점 표시)
+    sql '<SELECT ...>' --db <url|id> [--db ...] [--source S] [--limit N]
+                      DB 행들을 메모리 SQLite 로 적재 후 읽기 전용 쿼리.
+                      조인/집계/서브쿼리 가능. 테이블명 t (여러 개면 t1,t2,...),
+                      컬럼 = 속성명 + id, url. 날짜는 시작일, 체크박스는 0/1
+    edit-str <url|id> --old '<기존>' --new '<새>' [--all]
+                      블록 내 문자열 치환 (read 출력의 markdown 형태로 매칭).
+                      복수 매칭 시 목록 보여주고 중단, --all 로 전부 치환.
+                      블록 하나 안의 문자열만 가능 (Notion 구조 제약)
     write <parent-url|id> <title> [--file md.md] [--prop '이름=값']... [--source S]
                       allowlist 하위에만 새 페이지 생성 (markdown → 블록 변환)
                       md 확장 문법: '#> 제목'~'####> 제목' = 토글 헤딩
@@ -288,6 +297,30 @@ def file_url(d: dict) -> str:
 LIST_TYPES = {"bulleted_list_item", "numbered_list_item", "to_do", "toggle"}
 
 
+def ancestor_path(obj: dict, max_depth: int = 5) -> str:
+    """부모 체인을 '상위 > ... > 직계부모' 문자열로. 동명 문서 구분, 위치 파악용."""
+    names = []
+    p = obj.get("parent", {})
+    for _ in range(max_depth):
+        try:
+            if p.get("type") == "page_id":
+                parent = call("GET", f"/pages/{p['page_id']}")
+                names.append(page_title(parent))
+            elif p.get("type") == "database_id":
+                parent = call("GET", f"/databases/{p['database_id']}")
+                names.append("🗃️ " + (rt(parent.get("title")) or "(untitled)"))
+            elif p.get("type") == "block_id":
+                parent = call("GET", f"/blocks/{p['block_id']}")
+                p = parent.get("parent", {})
+                continue  # 블록은 경로에 이름 없이 통과
+            else:
+                break  # workspace 도달
+            p = parent.get("parent", {})
+        except ApiError:
+            break
+    return " > ".join(reversed(names))
+
+
 def render_block(b: dict, indent: str, out: list, state: dict):
     t = b.get("type", "unsupported")
     d = b.get(t, {}) or {}
@@ -384,6 +417,9 @@ def page_to_markdown(pid: str, show_ids: bool = False, query: dict = None):
     title = page_title(page)
     url = page.get("url", "")
     out = []
+    path = ancestor_path(page)
+    if path:
+        out.append(f"경로: {path}")
     # DB 행이면 속성부터 - 상태/담당자 같은 메타데이터가 본문만큼 중요하다
     if page.get("parent", {}).get("type") in ("database_id", "data_source_id"):
         plines = [f"- {n} [{p.get('type')}]: {prop_value_str(p)}"
@@ -480,6 +516,9 @@ def database_to_markdown(dbid: str, query: dict = None):
     title = rt(db.get("title")) or "(untitled database)"
     url = db.get("url", "")
     lines = [f"# 🗃️ {title}"]
+    path = ancestor_path(db)
+    if path:
+        lines.append(f"경로: {path}")
     sources = db.get("data_sources", [])
     sel = query.get("source")
     if sel:
@@ -728,17 +767,63 @@ def cmd_read(argv):
     print(f"SOURCE: {url}", file=sys.stderr)
 
 
+def _cache_body_search(query: str, exclude_ids: set):
+    """로컬 캐시 본문 검색 (공식 API 는 제목만 검색하는 제약의 우회층)."""
+    try:
+        files = [f for f in os.listdir(CACHE_DIR) if f.endswith(".md")]
+    except FileNotFoundError:
+        return None  # 캐시 자체가 없음
+    q = query.lower()
+    hits = []
+    for fn in files:
+        pid = fn[:-3]
+        if pid in exclude_ids:
+            continue
+        try:
+            with open(os.path.join(CACHE_DIR, fn), encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        if q not in text.lower():
+            continue
+        lines = text.splitlines()
+        title = url = fetched = ""
+        for line in lines[:6]:
+            if line.startswith("title: "):
+                title = line[7:]
+            elif line.startswith("url: "):
+                url = line[5:]
+            elif line.startswith("fetched_at: "):
+                fetched = line[12:]
+        snips = [ln.strip()[:100] for ln in lines[6:] if q in ln.lower()][:2]
+        hits.append((title, url, fetched, snips))
+    return hits
+
+
 def cmd_search(query: str):
     data = call("POST", "/search", {"query": query, "page_size": 25})
     results = data.get("results", [])
-    if not results:
-        print(f"NO_MATCH: 제목에 {query!r} 포함하는 페이지 없음"
-              " (공식 API 는 제목만 검색 - 본문은 캐시 rg 로)")
-        return
-    for r in results:
-        t = page_title(r) if r.get("object") == "page" else rt(r.get("title"))
-        print(f"[{r.get('object')}] {t}\n  {r.get('url', '')}\n  id: {r.get('id')}"
-              f"  edited: {r.get('last_edited_time', '')[:10]}")
+    if results:
+        print(f"== 제목 매칭 ({len(results)}건) ==")
+        for r in results:
+            t = page_title(r) if r.get("object") == "page" else rt(r.get("title"))
+            print(f"[{r.get('object')}] {t}\n  {r.get('url', '')}\n  id: {r.get('id')}"
+                  f"  edited: {r.get('last_edited_time', '')[:10]}")
+    else:
+        print(f"제목 매칭 없음: {query!r} (공식 API 는 제목만 검색)")
+
+    # 2층: 캐시 본문 - 제목 검색이 못 잡는 본문 언급을 잡는다
+    body_hits = _cache_body_search(query, {r.get("id", "") for r in results})
+    if body_hits is None:
+        print("\n본문 검색 불가: 캐시 없음 - `sync` 로 미러 구축 후 재시도")
+    elif body_hits:
+        print(f"\n== 본문 매칭 (로컬 캐시 {len(body_hits)}건, fetched_at 시점 기준) ==")
+        for title, url, fetched, snips in body_hits:
+            print(f"[cache] {title}\n  {url}\n  fetched: {fetched}")
+            for s in snips:
+                print(f"  > {s}")
+    else:
+        print("\n본문 매칭 없음 (캐시 기준 - 오래됐으면 `sync` 후 재시도)")
 
 
 def _item_title(r: dict) -> str:
@@ -1296,16 +1381,132 @@ def cmd_upload(argv):
         print(f"ATTACHED: {btype} block → {pid}")
 
 
+# ---------- SQL 질의 (데이터 소스 → 로컬 SQLite, 조인/집계 가능) ----------
+
+def _sql_value(p: dict):
+    """속성 값 → SQLite 셀. 빈 값은 NULL, 숫자/체크박스는 숫자형, 날짜는 시작일."""
+    t = p.get("type")
+    v = p.get(t)
+    if v in (None, [], ""):
+        return None
+    if t == "number":
+        return v
+    if t == "checkbox":
+        return 1 if v else 0
+    if t == "date":
+        return v.get("start")
+    s = prop_value_str(p)
+    return None if s == "(비어있음)" else s
+
+
+def cmd_sql(argv):
+    """DB 행들을 메모리 SQLite 로 적재 후 읽기 전용 쿼리 실행. 조인/집계/서브쿼리 전부 가능."""
+    if not argv or "--db" not in argv:
+        sys.exit("USAGE: sql '<SELECT ...>' --db <url|id> [--db ...] [--source S] [--limit N]\n"
+                 "테이블명: DB 1개면 t, 여러 개면 순서대로 t1, t2, ... 컬럼 = 속성명 + id, url")
+    query = argv[0]
+    dbs = [argv[i + 1] for i, a in enumerate(argv) if a == "--db"]
+    per_limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else 1000
+    source_sel = argv[argv.index("--source") + 1] if "--source" in argv else None
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+
+    for idx, ref in enumerate(dbs, 1):
+        dbid = to_page_id(ref)
+        ds = resolve_data_source(dbid, source_sel)
+        if not ds:
+            sys.exit(f"NOT_DB: {ref} 는 데이터베이스가 아님")
+        schema = call("GET", f"/data_sources/{ds}", version=DS_API_VERSION).get("properties", {})
+        cols = list(schema.keys())
+        tname = "t" if len(dbs) == 1 else f"t{idx}"
+        col_defs = ", ".join([f'"{c}"' for c in cols] + ['"id"', '"url"'])
+        conn.execute(f'CREATE TABLE "{tname}" ({col_defs})')
+        rows, more = query_data_source(ds, {}, per_limit)
+        for r in rows:
+            props = r.get("properties", {})
+            vals = [_sql_value(props[c]) if c in props else None for c in cols] \
+                + [r["id"], r.get("url", "")]
+            conn.execute(f'INSERT INTO "{tname}" VALUES ({",".join("?" * len(vals))})', vals)
+        note = f" (상한 도달 - --limit 로 확장)" if more else ""
+        print(f"{tname}: {len(rows)}행{note}, 컬럼: {', '.join(cols)}, id, url", file=sys.stderr)
+
+    conn.execute("PRAGMA query_only = ON")  # 로컬 사본 읽기 전용 - 쿼리로는 아무것도 못 바꿈
+    try:
+        cur = conn.execute(query)
+    except sqlite3.Error as e:
+        sys.exit(f"SQL_ERROR: {e}")
+    out_cols = [d[0] for d in cur.description or []]
+    results = cur.fetchall()
+    if not out_cols:
+        print("(결과 컬럼 없음)")
+        return
+
+    def esc(x):
+        return ("" if x is None else str(x)).replace("|", "\\|").replace("\n", " ")
+
+    print("| " + " | ".join(out_cols) + " |")
+    print("|" + "---|" * len(out_cols))
+    for row in results:
+        print("| " + " | ".join(esc(x) for x in row) + " |")
+    print(f"\n({len(results)}행)")
+
+
+# ---------- 문자열 치환 편집 (old_str → new_str, Edit 도구 대응) ----------
+
+def _walk_text_blocks(root: str, state: dict, out: list):
+    """텍스트 계열 블록 수집 (하위 페이지/DB 안으로는 안 내려감)."""
+    for b in get_children(root, state):
+        t = b.get("type")
+        if t in RICH_TEXT_TYPES or t == "code":
+            out.append(b)
+        if b.get("has_children") and t not in ("child_page", "child_database"):
+            _walk_text_blocks(b["id"], state, out)
+
+
+def cmd_edit_str(argv):
+    pid = to_page_id(argv[0])
+    if "--old" not in argv or "--new" not in argv:
+        sys.exit("USAGE: edit-str <url|id> --old '<기존>' --new '<새>' [--all]")
+    old = argv[argv.index("--old") + 1]
+    new = argv[argv.index("--new") + 1]
+    assert_writable(pid, kind="block")
+
+    state = {"fetched": 0, "truncated": False}
+    blocks = []
+    _walk_text_blocks(pid, state, blocks)
+    hits = []
+    for b in blocks:
+        text = rt((b.get(b["type"]) or {}).get("rich_text"))
+        if old in text:
+            hits.append((b, text))
+    if not hits:
+        sys.exit("NOT_FOUND: --old 문자열과 매칭되는 블록 없음.\n"
+                 "매칭 대상은 read 가 출력하는 markdown 형태 그대로이며, 문자열이 블록 하나\n"
+                 "안에 있어야 한다 (여러 블록에 걸친 치환은 불가 - Notion 구조 제약).")
+    if len(hits) > 1 and "--all" not in argv:
+        listing = "\n".join(f"  ⟨{b['type']} {b['id']}⟩ {txt[:60]}" for b, txt in hits)
+        sys.exit(f"AMBIGUOUS: {len(hits)}개 블록 매칭 - --all 로 전부 치환하거나 "
+                 f"edit <block-id> 로 특정:\n{listing}")
+    for b, text in hits:
+        t = b["type"]
+        newtext = text.replace(old, new)
+        payload = ({"code": {"rich_text": chunk_text(newtext)}} if t == "code"
+                   else {t: {"rich_text": md_rich_text(newtext)}})
+        call("PATCH", f"/blocks/{b['id']}", payload)
+        print(f"EDITED: {t} ⟨{b['id']}⟩")
+    print(f"OK: {len(hits)}개 블록 치환")
+
+
 # ---------- 댓글 (읽기 자유, 게시는 write ∪ comment 허용목록) ----------
 
 def fetch_comments(bid: str):
-    """블록/페이지의 미해결 댓글 전부 (resolved 스레드는 API 가 안 준다)."""
+    """블록/페이지의 미해결 댓글 전부 (resolved 스레드는 공개 API 미노출 - 구조 제약)."""
     results, cursor = [], None
     while True:
         q = f"/comments?block_id={bid}&page_size=100"
         if cursor:
             q += f"&start_cursor={urllib.parse.quote(cursor)}"
-        data = call("GET", q)
+        data = call("GET", q, version=DS_API_VERSION)  # display_name(작성자) 동봉되는 신버전
         results += data.get("results", [])
         if not data.get("has_more"):
             return results
@@ -1332,9 +1533,11 @@ def render_comments(comments):
         kind = "block" if anchor.get("type") == "block_id" else "page"
         print(f"[discussion {did}] ({kind} {where})")
         for c in sorted(cs.values(), key=lambda x: x.get("created_time", "")):
-            uid = (c.get("created_by") or {}).get("id", "")
+            name = (c.get("display_name") or {}).get("resolved_name")
+            if not name:  # 구응답 폴백 - 유저 개별 조회
+                name = _comment_user_name((c.get("created_by") or {}).get("id", ""))
             t = (c.get("created_time") or "")[:16].replace("T", " ")
-            print(f"  {t} {_comment_user_name(uid)}: {rt(c.get('rich_text'))}")
+            print(f"  {t} {name}: {rt(c.get('rich_text'))}")
 
 
 def collect_block_ids(root: str, state: dict):
@@ -1645,7 +1848,15 @@ def cmd_duplicate(argv):
     new = call("POST", "/pages", body, version=DS_API_VERSION)
 
     state = {"copied": 0, "skipped": []}
-    _copy_children_into(src, new["id"], state)
+    try:
+        _copy_children_into(src, new["id"], state)
+    except BaseException:  # 본문 복제 실패 시 껍데기 페이지 잔존 방지 - 자동 롤백
+        try:
+            call("PATCH", f"/pages/{new['id']}", {"archived": True})
+            print(f"ROLLBACK: 복제 실패 - 생성했던 페이지 archive ⟨{new['id']}⟩", file=sys.stderr)
+        except ApiError:
+            print(f"ROLLBACK_FAIL: 실패 잔존물 수동 정리 필요 ⟨{new['id']}⟩", file=sys.stderr)
+        raise
     note = f", 스킵 {len(state['skipped'])}개({','.join(set(state['skipped']))})" if state["skipped"] else ""
     print(f"DUPLICATED: {new_title} - {state['copied']}블록 복제{note}")
     print(f"URL: {new.get('url', '')}")
@@ -1892,6 +2103,10 @@ def main():
             cmd_db_create(sys.argv[2:])
         elif cmd == "db-prop":
             cmd_db_prop(sys.argv[2:])
+        elif cmd == "sql":
+            cmd_sql(sys.argv[2:])
+        elif cmd == "edit-str":
+            cmd_edit_str(sys.argv[2:])
         elif cmd == "duplicate":
             cmd_duplicate(sys.argv[2:])
         elif cmd == "archive":
