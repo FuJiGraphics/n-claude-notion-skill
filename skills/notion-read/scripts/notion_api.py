@@ -56,6 +56,11 @@ OAuth 앱 자격증명 (팀 관리자가 1회 등록, 사내 채널로 배포):
                      [--start | --after <block_id>]
                       allowlist 하위 페이지에 블록 추가. 기본 끝, --start 면 맨 위,
                       --after 면 지정 블록 뒤 (--json = 원시 블록 탈출구)
+    duplicate <url|id> [--to <dest>] [--title '<새 제목>']
+                      페이지/DB행 복제 (속성 + 본문 트리, 내부 파일 재업로드).
+                      기본 목적지 = 원본과 같은 부모. 기본 제목 = '원본 (copy)'
+    archive <url|id>  페이지/블록을 휴지통으로 (복구 가능)
+    restore <url|id>  휴지통에서 복구 (archived 해제)
     prop <url|id>     페이지 속성 나열 (이름 [타입] = 값)
     prop <url|id> --set '이름=값' [--set ...] | --json props.json
                       속성 갱신 (allowlist 가드). select/status/multi_select(쉼표)/
@@ -80,8 +85,10 @@ OAuth 앱 자격증명 (팀 관리자가 1회 등록, 사내 채널로 배포):
                         목적지가 DB 면 data_source 자동 해석. DB간 이동 지원.
                       - 블록 → 복제→검증→원본 archive 합성. 내부 파일은 재업로드로 영구화.
                       DB 자체는 이동 불가(API 한계). --after/--start 는 블록 이동 전용
-    sync [limit]      접근 가능한 페이지+DB 를 순회하며 캐시 구축 (기본 200장 제한)
+    sync [limit] [--full]
+                      접근 가능한 페이지+DB 를 순회하며 캐시 구축 (기본 200장 제한)
                       본문 grep 은 이 캐시 위에서 rg 로 한다. DB 는 행 표로 캐시됨.
+                      증분: last_edited_time 이 캐시와 같으면 생략, --full 로 강제 전체.
 
 캐시: ~/.claude/notion/cache/<page_id>.md (frontmatter 에 title/url/fetched_at)
 
@@ -365,7 +372,7 @@ def render_block(b: dict, indent: str, out: list, state: dict):
 
 
 def page_to_markdown(pid: str, show_ids: bool = False, query: dict = None):
-    """(title, url, markdown) 반환. 페이지가 아니면 데이터베이스로 재시도."""
+    """(title, url, markdown, last_edited) 반환. 페이지가 아니면 데이터베이스로 재시도."""
     state = {"fetched": 0, "truncated": False, "ids": show_ids}
     try:
         page = call("GET", f"/pages/{pid}")
@@ -388,7 +395,7 @@ def page_to_markdown(pid: str, show_ids: bool = False, query: dict = None):
     md = f"# {title}\n\n" + "\n\n".join(out)
     if state["truncated"]:
         md += f"\n\n---\n*[TRUNCATED: 블록 {MAX_BLOCKS}개 상한 도달 - 페이지 뒷부분 생략됨]*"
-    return title, url, md
+    return title, url, md, page.get("last_edited_time", "")
 
 
 def build_filter(schema: dict, expr: str) -> dict:
@@ -501,7 +508,7 @@ def database_to_markdown(dbid: str, query: dict = None):
         note = " - 더 있음, --limit 로 확장" if more else ""
         lines.append(f"\n## Rows ({len(rows)}행{note})")
         lines += rows_to_table(schema, rows) if rows else ["*조건에 맞는 행 없음*"]
-    return title, url, "\n".join(lines)
+    return title, url, "\n".join(lines), db.get("last_edited_time", "")
 
 
 # ---------- 페이지 속성 (DB 카드 워크플로: 상태 변경 등) ----------
@@ -648,13 +655,27 @@ def cmd_prop(argv):
 
 # ---------- 캐시 ----------
 
-def write_cache(pid: str, title: str, url: str, md: str) -> str:
+def write_cache(pid: str, title: str, url: str, md: str, edited: str = "") -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, f"{pid}.md")
     fetched_at = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(f"---\ntitle: {title}\nurl: {url}\nfetched_at: {fetched_at}\n---\n\n{md}\n")
+        f.write(f"---\ntitle: {title}\nurl: {url}\nfetched_at: {fetched_at}\n"
+                f"edited: {edited}\n---\n\n{md}\n")
     return path
+
+
+def cached_edited(pid: str) -> str:
+    """캐시된 페이지의 last_edited_time (sync 증분 비교용). 없으면 ''."""
+    try:
+        with open(os.path.join(CACHE_DIR, f"{pid}.md"), encoding="utf-8") as f:
+            for _ in range(6):  # frontmatter 안에서만 찾는다
+                line = f.readline()
+                if line.startswith("edited: "):
+                    return line[8:].strip()
+        return ""
+    except (FileNotFoundError, OSError):
+        return ""
 
 
 # ---------- 명령 ----------
@@ -698,11 +719,11 @@ def cmd_read(argv):
     pid = to_page_id(argv[0])
     show_ids = "--ids" in argv
     query = parse_query_opts(argv)
-    title, url, md = page_to_markdown(pid, show_ids, query)
+    title, url, md, edited = page_to_markdown(pid, show_ids, query)
     print(md)
     # id 마커나 필터/정렬된 부분 뷰는 캐시(grep 대상)를 오염시키므로 저장 안 함
     if not show_ids and not query:
-        cache = write_cache(pid, title, url, md)
+        cache = write_cache(pid, title, url, md, edited)
         print(f"\nCACHED: {cache}", file=sys.stderr)
     print(f"SOURCE: {url}", file=sys.stderr)
 
@@ -1091,6 +1112,8 @@ def cmd_write(argv):
     title = argv[1]
     blocks = md_to_blocks(read_md_arg(argv)) if ("--file" in argv or "--text" in argv) else []
     source_sel = argv[argv.index("--source") + 1] if "--source" in argv else None
+    icon = ({"type": "emoji", "emoji": argv[argv.index("--icon") + 1]}
+            if "--icon" in argv else None)
     ds = resolve_data_source(parent, source_sel)
 
     if ds:  # DB 가 목적지 → 행 생성 (--prop '이름=값' 으로 속성 지정)
@@ -1107,15 +1130,19 @@ def cmd_write(argv):
                 sys.exit(f"NO_PROP: {name!r} 속성 없음. 있는 것: {', '.join(schema)}")
             ptype = schema[name].get("type")
             properties[name] = {ptype: build_prop_payload(ptype, value)}
-        page = call("POST", "/pages", {
-            "parent": {"type": "data_source_id", "data_source_id": ds},
-            "properties": properties}, version=DS_API_VERSION)
+        body = {"parent": {"type": "data_source_id", "data_source_id": ds},
+                "properties": properties}
+        if icon:
+            body["icon"] = icon
+        page = call("POST", "/pages", body, version=DS_API_VERSION)
         label = "CREATED(row)"
     else:
         assert_writable(parent)
-        page = call("POST", "/pages", {
-            "parent": {"page_id": parent},
-            "properties": {"title": {"title": [{"type": "text", "text": {"content": title}}]}}})
+        body = {"parent": {"page_id": parent},
+                "properties": {"title": {"title": [{"type": "text", "text": {"content": title}}]}}}
+        if icon:
+            body["icon"] = icon
+        page = call("POST", "/pages", body)
         label = "CREATED"
 
     # 본문은 생성 후 append - 중첩 리스트의 층별 전송 로직을 한 경로로 통일
@@ -1160,10 +1187,12 @@ def cmd_db_create(argv):
             props[name] = piece
     if not any("title" in p for p in props.values()):
         props["이름"] = {"title": {}}  # title 속성은 DB 필수 - 미지정 시 기본 생성
-    db = call("POST", "/databases", {
-        "parent": {"type": "page_id", "page_id": parent},
-        "title": [{"type": "text", "text": {"content": title}}],
-        "initial_data_source": {"properties": props}}, version=DS_API_VERSION)
+    body = {"parent": {"type": "page_id", "page_id": parent},
+            "title": [{"type": "text", "text": {"content": title}}],
+            "initial_data_source": {"properties": props}}
+    if "--icon" in argv:
+        body["icon"] = {"type": "emoji", "emoji": argv[argv.index("--icon") + 1]}
+    db = call("POST", "/databases", body, version=DS_API_VERSION)
     ds = (db.get("data_sources") or [{}])[0]
     print(f"CREATED_DB: {title}")
     print(f"URL: {db.get('url', '')}")
@@ -1383,6 +1412,25 @@ CREATE_FIELDS = {
 }
 
 
+def _rechunk_rich_text(arr):
+    """GET 응답은 인접 text 를 서버가 병합해 2000자 초과 항목을 줄 수 있다 - 생성용 재분할."""
+    out = []
+    for t in arr or []:
+        content = (t.get("text") or {}).get("content") if t.get("type") == "text" else None
+        if content is not None and len(content) > 2000:
+            link = (t.get("text") or {}).get("link")
+            for i in range(0, len(content), 2000):
+                nt = {"type": "text", "text": {"content": content[i:i + 2000]}}
+                if link:
+                    nt["text"]["link"] = link
+                if t.get("annotations"):
+                    nt["annotations"] = t["annotations"]
+                out.append(nt)
+        else:
+            out.append(t)
+    return out
+
+
 def block_to_payload(b: dict, state: dict):
     """GET 으로 받은 블록 → 생성용 payload. Notion 내부 파일은 재업로드로 영구화."""
     t = b.get("type")
@@ -1400,6 +1448,11 @@ def block_to_payload(b: dict, state: dict):
     # callout 아이콘이 업로드 파일이면 생성 시 못 받음 - 제거 (이모지/external 은 통과)
     if t == "callout" and isinstance(d.get("icon"), dict) and d["icon"].get("type") not in ("emoji", "external"):
         d.pop("icon", None)
+    for k in ("rich_text", "caption"):
+        if d.get(k):
+            d[k] = _rechunk_rich_text(d[k])
+    if d.get("cells"):
+        d["cells"] = [_rechunk_rich_text(c) for c in d["cells"]]
     if t in MEDIA_BLOCK_TYPES:
         if d.get("type") == "file":  # Notion 내부 호스팅 - 서명 URL 은 1시간 만료
             fid = upload_from_url(d["file"]["url"], f"{t}.bin")
@@ -1419,6 +1472,19 @@ def block_to_payload(b: dict, state: dict):
     return {"type": t, t: d}
 
 
+def _inline_table_rows(src_id: str, payload: dict, state: dict) -> dict:
+    """table 은 생성 시 table_row children 동봉이 필수 - 원본 행을 인라인으로 채운다."""
+    fetch_state = {"fetched": 0, "truncated": False}
+    rows = []
+    for r in get_children(src_id, fetch_state):
+        rp = block_to_payload(r, state)
+        if rp:
+            rows.append(rp)
+            state["copied"] += 1
+    payload["table"]["children"] = rows
+    return payload
+
+
 def copy_block_tree(src_id: str, dest_id: str, state: dict, position=None):
     """src 블록(하위 트리 포함)을 dest 의 children 으로 복제. 생성된 최상위 블록 id 반환."""
     src = call("GET", f"/blocks/{src_id}")
@@ -1426,13 +1492,15 @@ def copy_block_tree(src_id: str, dest_id: str, state: dict, position=None):
     if payload is None:
         sys.exit(f"MOVE_UNSUPPORTED: {src.get('type')} 블록은 복제 불가 "
                  f"(child_page/synced_block 등은 Notion UI 에서만 이동 가능).")
+    if payload.get("type") == "table":
+        payload = _inline_table_rows(src_id, payload, state)
     body = {"children": [payload]}
     if position:
         body["position"] = position
     res = call("PATCH", f"/blocks/{dest_id}/children", body)
     new_id = res["results"][0]["id"]
     state["copied"] += 1
-    if src.get("has_children"):
+    if src.get("has_children") and src.get("type") != "table":  # 표 행은 위에서 소비함
         _copy_children_into(src_id, new_id, state)
     return new_id
 
@@ -1446,6 +1514,8 @@ def _copy_children_into(src_parent: str, dest_parent: str, state: dict):
         p = block_to_payload(k, state)
         if p is None:
             continue
+        if p.get("type") == "table":
+            p = _inline_table_rows(k["id"], p, state)
         payloads.append(p)
         sources.append(k)
     for i in range(0, len(payloads), 100):
@@ -1453,7 +1523,7 @@ def _copy_children_into(src_parent: str, dest_parent: str, state: dict):
                    {"children": payloads[i:i + 100]})
         for created, src in zip(res["results"], sources[i:i + 100]):
             state["copied"] += 1
-            if src.get("has_children"):
+            if src.get("has_children") and src.get("type") != "table":
                 _copy_children_into(src["id"], created["id"], state)
 
 
@@ -1530,6 +1600,82 @@ def cmd_move(argv):
         position = {"type": "after_block", "after_block": {"id": new_id}}
 
 
+# ---------- 페이지 수명주기 (복제 / archive / 복구) ----------
+
+READONLY_PROP_TYPES = {"formula", "rollup", "created_time", "created_by",
+                       "last_edited_time", "last_edited_by", "unique_id"}
+
+
+def cmd_duplicate(argv):
+    src = to_page_id(argv[0])
+    page = call("GET", f"/pages/{src}")
+    new_title = (argv[argv.index("--title") + 1] if "--title" in argv
+                 else page_title(page) + " (copy)")
+
+    if "--to" in argv:
+        guard_id = to_page_id(argv[argv.index("--to") + 1])
+        parent_obj = resolve_move_parent(guard_id)
+    else:  # 기본: 원본과 같은 부모 (DB 행이면 같은 DB)
+        p = page.get("parent", {})
+        if p.get("type") == "page_id":
+            guard_id = to_page_id(p["page_id"])
+            parent_obj = {"type": "page_id", "page_id": guard_id}
+        elif p.get("type") in ("database_id", "data_source_id"):
+            guard_id = to_page_id(p.get("database_id") or p.get("data_source_id"))
+            parent_obj = resolve_move_parent(guard_id)
+        else:
+            sys.exit("DUP_NEED_DEST: workspace 루트 페이지는 --to <목적지> 지정 필요")
+    # 가드는 페이지/DB id 로 탐색 (data_source id 는 조상 체인을 못 걸어 올라간다)
+    assert_writable(guard_id, kind="block")
+
+    props = {}
+    for name, prop in page.get("properties", {}).items():
+        t = prop.get("type")
+        if t in READONLY_PROP_TYPES:
+            continue
+        if t == "title":
+            props[name] = {"title": [{"type": "text", "text": {"content": new_title}}]}
+        elif prop.get(t) not in (None, [], ""):
+            props[name] = {t: prop[t]}
+    body = {"parent": parent_obj, "properties": props}
+    for deco in ("icon", "cover"):  # 이모지/외부 URL 만 복사 가능 (내부 파일은 서명 URL 이라 불가)
+        d = page.get(deco)
+        if isinstance(d, dict) and d.get("type") in ("emoji", "external"):
+            body[deco] = d
+    new = call("POST", "/pages", body, version=DS_API_VERSION)
+
+    state = {"copied": 0, "skipped": []}
+    _copy_children_into(src, new["id"], state)
+    note = f", 스킵 {len(state['skipped'])}개({','.join(set(state['skipped']))})" if state["skipped"] else ""
+    print(f"DUPLICATED: {new_title} - {state['copied']}블록 복제{note}")
+    print(f"URL: {new.get('url', '')}")
+    print(f"id: {new['id']}")
+
+
+def cmd_archive(argv):
+    pid = to_page_id(argv[0])
+    assert_writable(pid, kind="block")
+    try:
+        obj = call("PATCH", f"/pages/{pid}", {"archived": True})
+        what = f"페이지 \"{page_title(obj)}\""
+    except ApiError:
+        obj = call("PATCH", f"/blocks/{pid}", {"archived": True})
+        what = f"{obj.get('type')} 블록"
+    print(f"ARCHIVED: {what} ⟨{pid}⟩ - Notion 휴지통에서 복구 가능 (restore 명령)")
+
+
+def cmd_restore(argv):
+    pid = to_page_id(argv[0])
+    assert_writable(pid, kind="block")
+    try:
+        obj = call("PATCH", f"/pages/{pid}", {"archived": False})
+        what = f"페이지 \"{page_title(obj)}\""
+    except ApiError:
+        obj = call("PATCH", f"/blocks/{pid}", {"archived": False})
+        what = f"{obj.get('type')} 블록"
+    print(f"RESTORED: {what} ⟨{pid}⟩")
+
+
 RICH_TEXT_TYPES = {"paragraph", "heading_1", "heading_2", "heading_3", "heading_4",
                    "bulleted_list_item", "numbered_list_item", "to_do",
                    "toggle", "quote", "callout"}
@@ -1574,8 +1720,8 @@ def cmd_append(argv):
     print(f"APPENDED: {len(blocks)} blocks → {pid} ({where})")
 
 
-def cmd_sync(limit: int):
-    n, cursor = 0, None
+def cmd_sync(limit: int, full: bool = False):
+    n, skipped, cursor = 0, 0, None
     while n < limit:
         body = {"page_size": 100}
         if cursor:
@@ -1586,9 +1732,16 @@ def cmd_sync(limit: int):
                 break
             pid = pg["id"]
             is_db = pg.get("object") == "database"
+            edited = pg.get("last_edited_time", "")
+            # 증분: 마지막 수정 시각이 캐시와 같으면 본문 재다운로드 생략
+            if not full and edited and cached_edited(to_page_id(pid)) == edited:
+                n += 1
+                skipped += 1
+                continue
             try:
-                title, url, md = database_to_markdown(pid) if is_db else page_to_markdown(pid)
-                write_cache(pid, title, url, md)
+                title, url, md, edited = (database_to_markdown(pid) if is_db
+                                          else page_to_markdown(pid))
+                write_cache(pid, title, url, md, edited)
                 n += 1
                 print(f"[{n}/{limit}] {'🗃️ ' if is_db else ''}{title}", flush=True)
             except ApiError as e:
@@ -1596,7 +1749,8 @@ def cmd_sync(limit: int):
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
-    print(f"SYNCED: {n} pages → {CACHE_DIR}")
+    note = f" (미변경 {skipped}건 생략 - 전체 갱신은 --full)" if skipped else ""
+    print(f"SYNCED: {n} pages → {CACHE_DIR}{note}")
 
 
 def cmd_login(argv):
@@ -1738,6 +1892,12 @@ def main():
             cmd_db_create(sys.argv[2:])
         elif cmd == "db-prop":
             cmd_db_prop(sys.argv[2:])
+        elif cmd == "duplicate":
+            cmd_duplicate(sys.argv[2:])
+        elif cmd == "archive":
+            cmd_archive(sys.argv[2:])
+        elif cmd == "restore":
+            cmd_restore(sys.argv[2:])
         elif cmd == "comments":
             cmd_comments(sys.argv[2:])
         elif cmd == "comment":
@@ -1751,7 +1911,8 @@ def main():
         elif cmd == "move":
             cmd_move(sys.argv[2:])
         elif cmd == "sync":
-            cmd_sync(int(sys.argv[2]) if len(sys.argv) > 2 else 200)
+            nums = [a for a in sys.argv[2:] if a.isdigit()]
+            cmd_sync(int(nums[0]) if nums else 200, "--full" in sys.argv)
         else:
             print(__doc__)
             sys.exit(2)
