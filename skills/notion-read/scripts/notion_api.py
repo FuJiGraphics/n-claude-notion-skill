@@ -60,7 +60,18 @@ OAuth 앱 자격증명 (팀 관리자가 1회 등록, 사내 채널로 배포):
     prop <url|id> --set '이름=값' [--set ...] | --json props.json
                       속성 갱신 (allowlist 가드). select/status/multi_select(쉼표)/
                       number/checkbox/date(시작~끝)/url/email/title/rich_text 지원
+    comments <url|id> [--all]
+                      미해결 댓글 목록 (discussion 단위, 작성자/시각). 기본은 페이지
+                      레벨 스레드만 - --all 이면 블록 전체를 돌며 인라인 댓글까지
+                      (블록 수만큼 호출, 큰 페이지는 느림). resolved 는 API 미노출
+    comment <url|block-id> --text '<내용>' [--reply <discussion_id>]
+                      댓글 게시 (write ∪ comment 허용목록 하위만). --reply 는 기존
+                      스레드에 답글 - 이때 첫 인자는 스레드가 있는 페이지(가드용).
+                      주의: API 로 댓글 삭제 불가 - UI 에서만 지울 수 있다
+    users             워크스페이스 멤버/봇 목록 (people 속성 값, 담당자 지정용)
     allow <url|id>    쓰기 허용목록에 페이지 추가 (유저 명시 승인 후에만 사용)
+    allow --comment <url|id>
+                      댓글 전용 허용목록에 추가 (본문 쓰기는 계속 차단됨)
     upload <path> [--attach <url|id>]
                       File Upload API 로 영구 업로드, --attach 면 이미지/파일 블록로 첨부
     move <page|block_id> --to <dest> [--after <block_id> | --start]
@@ -551,7 +562,52 @@ def build_prop_payload(ptype: str, value: str):
         return d
     if ptype in ("url", "email", "phone_number"):
         return value
+    if ptype == "people":  # '이름' / '이메일' / 'id' 쉼표 구분 - users 목록에서 해석
+        return [{"id": resolve_user(s.strip())} for s in value.split(",") if s.strip()]
+    if ptype == "relation":  # 연결할 페이지 id/URL 쉼표 구분
+        return [{"id": to_page_id(s)} for s in value.split(",") if s.strip()]
     sys.exit(f"PROP_UNSUPPORTED: {ptype} 타입은 문자열 변환 미지원 - prop <id> --json props.json 사용.")
+
+
+# ---------- 사용자 (people 속성 해석 + 멘션 대상 조회) ----------
+
+def list_users():
+    results, cursor = [], None
+    while True:
+        q = "/users?page_size=100" + (f"&start_cursor={urllib.parse.quote(cursor)}" if cursor else "")
+        try:
+            data = call("GET", q)
+        except ApiError as e:
+            if e.code == 403:  # OAuth 개인 토큰(personal access token)은 목록 조회 금지
+                sys.exit("USERS_RESTRICTED: 이 토큰 타입은 유저 목록 조회 불가 (API 제약 -\n"
+                         "OAuth personal access token). internal integration 토큰으로 로그인하면\n"
+                         "가능. people 속성은 'user id' 를 직접 넣으면 이 토큰으로도 설정됨.")
+            raise
+        results += data.get("results", [])
+        if not data.get("has_more"):
+            return results
+        cursor = data.get("next_cursor")
+
+
+def resolve_user(sel: str) -> str:
+    """이름/이메일/id → user id. 애매하면(동명이인) 후보를 보여주고 종료."""
+    if UUID_RE.fullmatch(sel.replace("-", "")):
+        return to_page_id(sel)
+    hits = [u for u in list_users()
+            if u.get("name") == sel or (u.get("person") or {}).get("email") == sel]
+    if not hits:
+        sys.exit(f"NO_USER: {sel!r} 매칭 없음. `users` 명령으로 목록 확인.")
+    if len(hits) > 1:
+        cands = ", ".join(f"{u.get('name')}={u['id']}" for u in hits)
+        sys.exit(f"AMBIGUOUS_USER: {sel!r} 후보 여러 명 - id 로 지정: {cands}")
+    return hits[0]["id"]
+
+
+def cmd_users():
+    for u in list_users():
+        t = u.get("type", "?")
+        email = (u.get("person") or {}).get("email", "") if t == "person" else ""
+        print(f"[{t}] {u.get('name', '?')}  {email}  id: {u['id']}")
 
 
 def cmd_prop(argv):
@@ -729,25 +785,23 @@ def cmd_ls(args, limit=1000):
 # ---------- 쓰기 (allowlist 가드) ----------
 
 WRITE_ALLOWLIST = os.path.join(CONF_DIR, "write_allowlist")
+COMMENT_ALLOWLIST = os.path.join(CONF_DIR, "comment_allowlist")
 
 
-def assert_writable(pid: str, kind: str = "page"):
-    """대상(페이지/블록) 또는 그 조상이 write_allowlist 에 있어야 통과. 아니면 종료.
-
-    회사 워크스페이스 실문서 오염 방지용 - 코드 레벨 가드라 스킬/모델 실수로도 못 뚫는다.
-    """
+def _load_allowlist(path: str) -> set:
     try:
-        with open(WRITE_ALLOWLIST) as f:
-            allow = {to_page_id(line) for line in f if line.strip()}
+        with open(path) as f:
+            return {to_page_id(line) for line in f if line.strip()}
     except FileNotFoundError:
-        allow = set()
-    if not allow:
-        sys.exit("WRITE_DENIED: ~/.claude/notion/write_allowlist 비어 있음.\n"
-                 "쓰기를 허용할 최상위 페이지 id 를 한 줄에 하나씩 등록해야 함.")
+        return set()
+
+
+def _ancestor_allowed(pid: str, kind: str, allow: set) -> bool:
+    """대상 또는 그 조상이 allow 집합에 있으면 True. API 로 체인을 걸어 올라간다."""
     cur = pid
     for _ in range(30):  # 조상 체인 상한
         if cur in allow:
-            return
+            return True
         try:
             if kind == "page":
                 obj = call("GET", f"/pages/{cur}")
@@ -756,7 +810,7 @@ def assert_writable(pid: str, kind: str = "page"):
             else:
                 obj = call("GET", f"/blocks/{cur}")
         except ApiError:
-            break
+            return False
         p = obj.get("parent", {})
         if p.get("type") == "page_id":
             cur, kind = to_page_id(p["page_id"]), "page"
@@ -765,29 +819,56 @@ def assert_writable(pid: str, kind: str = "page"):
         elif p.get("type") == "block_id":
             cur, kind = to_page_id(p["block_id"]), "block"
         else:  # workspace 도달
-            break
+            return False
+    return False
+
+
+def assert_writable(pid: str, kind: str = "page"):
+    """대상(페이지/블록) 또는 그 조상이 write_allowlist 에 있어야 통과. 아니면 종료.
+
+    회사 워크스페이스 실문서 오염 방지용 - 코드 레벨 가드라 스킬/모델 실수로도 못 뚫는다.
+    """
+    allow = _load_allowlist(WRITE_ALLOWLIST)
+    if not allow:
+        sys.exit("WRITE_DENIED: ~/.claude/notion/write_allowlist 비어 있음.\n"
+                 "쓰기를 허용할 최상위 페이지 id 를 한 줄에 하나씩 등록해야 함.")
+    if _ancestor_allowed(pid, kind, allow):
+        return
     sys.exit(f"WRITE_DENIED: {pid} 는 로컬 쓰기 허용목록 밖.\n"
              "Notion 권한 문제 아님 - 토큰은 공유된 모든 페이지에 쓰기 가능하지만,\n"
              "실문서 보호를 위해 이 도구가 자체적으로 막는 것 (~/.claude/notion/write_allowlist).\n"
              "유저가 명시 승인했다면: notion_api.py allow '<page-url-or-id>' 로 열 수 있음.")
 
 
-def cmd_allow(argv):
-    pid = to_page_id(argv[0])
-    os.makedirs(CONF_DIR, exist_ok=True)
-    existing = set()
-    try:
-        with open(WRITE_ALLOWLIST) as f:
-            existing = {to_page_id(line) for line in f if line.strip()}
-    except FileNotFoundError:
-        pass
-    if pid in existing:
-        print(f"ALREADY: {pid} 이미 허용목록에 있음")
+def assert_commentable(pid: str, kind: str = "block"):
+    """댓글 게시 가드: write_allowlist ∪ comment_allowlist 하위면 통과.
+
+    댓글은 본문을 파괴하진 않지만 API 로 삭제가 불가능하다(UI 수동 제거만 가능) -
+    그래서 본문 쓰기보다 한 단계 가벼운 전용 허용목록을 합집합으로 둔다.
+    """
+    allow = _load_allowlist(WRITE_ALLOWLIST) | _load_allowlist(COMMENT_ALLOWLIST)
+    if allow and _ancestor_allowed(pid, kind, allow):
         return
-    with open(WRITE_ALLOWLIST, "a") as f:
+    sys.exit(f"COMMENT_DENIED: {pid} 는 댓글 허용목록 밖.\n"
+             "본문 쓰기 없이 댓글만 허용하려면 (유저 명시 승인 후):\n"
+             "  notion_api.py allow --comment '<page-url-or-id>'\n"
+             "(write_allowlist 에 있는 페이지는 자동으로 댓글도 허용됨)")
+
+
+def cmd_allow(argv):
+    comment_only = "--comment" in argv
+    target_file = COMMENT_ALLOWLIST if comment_only else WRITE_ALLOWLIST
+    label = "댓글" if comment_only else "쓰기"
+    pid = to_page_id([a for a in argv if not a.startswith("--")][0])
+    os.makedirs(CONF_DIR, exist_ok=True)
+    existing = _load_allowlist(target_file)
+    if pid in existing:
+        print(f"ALREADY: {pid} 이미 {label} 허용목록에 있음")
+        return
+    with open(target_file, "a") as f:
         f.write(pid + "\n")
-    os.chmod(WRITE_ALLOWLIST, 0o600)
-    print(f"ALLOWED: {pid} (+하위 전체) 쓰기 허용. 총 {len(existing) + 1}건")
+    os.chmod(target_file, 0o600)
+    print(f"ALLOWED: {pid} (+하위 전체) {label} 허용. 총 {len(existing) + 1}건")
 
 
 INLINE_RE = re.compile(r"(\*\*.+?\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))")
@@ -1074,6 +1155,93 @@ def cmd_upload(argv):
         append_blocks(pid, [{"type": btype, btype: {
             "type": "file_upload", "file_upload": {"id": fid}}}])
         print(f"ATTACHED: {btype} block → {pid}")
+
+
+# ---------- 댓글 (읽기 자유, 게시는 write ∪ comment 허용목록) ----------
+
+def fetch_comments(bid: str):
+    """블록/페이지의 미해결 댓글 전부 (resolved 스레드는 API 가 안 준다)."""
+    results, cursor = [], None
+    while True:
+        q = f"/comments?block_id={bid}&page_size=100"
+        if cursor:
+            q += f"&start_cursor={urllib.parse.quote(cursor)}"
+        data = call("GET", q)
+        results += data.get("results", [])
+        if not data.get("has_more"):
+            return results
+        cursor = data.get("next_cursor")
+
+
+def _comment_user_name(uid: str, cache={}) -> str:
+    if uid not in cache:
+        try:
+            cache[uid] = call("GET", f"/users/{uid}").get("name") or uid[:8]
+        except ApiError:
+            cache[uid] = uid[:8]
+    return cache[uid]
+
+
+def render_comments(comments):
+    """discussion 단위로 묶어 시간순 출력. discussion id 는 --reply 대상."""
+    by_disc = {}
+    for c in comments:
+        by_disc.setdefault(c.get("discussion_id"), {})[c["id"]] = c  # id 로 dedupe
+    for did, cs in by_disc.items():
+        anchor = next(iter(cs.values())).get("parent", {})
+        where = anchor.get("block_id") or anchor.get("page_id") or "?"
+        kind = "block" if anchor.get("type") == "block_id" else "page"
+        print(f"[discussion {did}] ({kind} {where})")
+        for c in sorted(cs.values(), key=lambda x: x.get("created_time", "")):
+            uid = (c.get("created_by") or {}).get("id", "")
+            t = (c.get("created_time") or "")[:16].replace("T", " ")
+            print(f"  {t} {_comment_user_name(uid)}: {rt(c.get('rich_text'))}")
+
+
+def collect_block_ids(root: str, state: dict):
+    """페이지 전체 블록 id 수집 (하위 페이지/DB 안까지는 안 내려감)."""
+    out = []
+    for b in get_children(root, state):
+        out.append(b["id"])
+        if b.get("has_children") and b.get("type") not in ("child_page", "child_database"):
+            out += collect_block_ids(b["id"], state)
+    return out
+
+
+def cmd_comments(argv):
+    pid = to_page_id(argv[0])
+    comments = fetch_comments(pid)
+    if "--all" in argv:  # 인라인(블록 앵커) 댓글까지: 블록 수만큼 API 호출 - 큰 페이지는 느림
+        state = {"fetched": 0, "truncated": False}
+        for bid in collect_block_ids(pid, state):
+            comments += fetch_comments(bid)
+    if not comments:
+        hint = "" if "--all" in argv else " (인라인 블록 댓글까지 보려면 --all)"
+        print(f"NO_COMMENTS: 미해결 댓글 없음{hint} - resolved 스레드는 API 에 안 나옴")
+        return
+    render_comments(comments)
+
+
+def cmd_comment(argv):
+    target = to_page_id(argv[0])
+    if "--text" not in argv:
+        sys.exit("NO_CONTENT: --text '<내용>' 필요.")
+    text = argv[argv.index("--text") + 1]
+    assert_commentable(target, kind="block")
+    if "--reply" in argv:  # target 은 가드용(스레드가 있는 페이지), API 는 discussion 에 단다
+        body = {"discussion_id": argv[argv.index("--reply") + 1],
+                "rich_text": md_rich_text(text)}
+    else:
+        is_page = True
+        try:
+            call("GET", f"/pages/{target}")
+        except ApiError:
+            is_page = False
+        parent = {"page_id": target} if is_page else {"block_id": target}
+        body = {"parent": parent, "rich_text": md_rich_text(text)}
+    res = call("POST", "/comments", body, version=DS_API_VERSION)
+    print(f"COMMENTED: discussion {res.get('discussion_id')}")
+    print("주의: API 로는 댓글 삭제 불가 - 잘못 달았으면 Notion UI 에서 수동 제거해야 함.")
 
 
 # ---------- 블록 이동 (합성 명령: 복제 → 검증 → 원본 archive) ----------
@@ -1460,6 +1628,12 @@ def main():
             cmd_db_create(sys.argv[2:])
         elif cmd == "db-prop":
             cmd_db_prop(sys.argv[2:])
+        elif cmd == "comments":
+            cmd_comments(sys.argv[2:])
+        elif cmd == "comment":
+            cmd_comment(sys.argv[2:])
+        elif cmd == "users":
+            cmd_users()
         elif cmd == "allow":
             cmd_allow(sys.argv[2:])
         elif cmd == "upload":

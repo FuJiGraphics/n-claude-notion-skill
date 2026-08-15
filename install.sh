@@ -7,7 +7,7 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HOME/.claude/skills"
 mkdir -p "$DEST"
 
-for s in notion-login notion-logout notion-read notion-grep notion-ls notion-write notion-edit; do
+for s in notion-login notion-logout notion-read notion-grep notion-ls notion-write notion-edit notion-comment; do
   rm -rf "$DEST/$s"
   ln -sfn "$REPO/skills/$s" "$DEST/$s"
   echo "linked: $DEST/$s -> $REPO/skills/$s"
