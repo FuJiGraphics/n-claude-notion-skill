@@ -37,8 +37,23 @@ a top-level page covers all its sub-pages).
 
    stdout is the rendered markdown; stderr reports `CACHED:` (a copy saved to
    `~/.claude/notion/cache/` — this is what makes `/notion-grep` full-text search
-   work later) and `SOURCE:` (canonical URL). Database ids render as a schema +
-   row listing instead of prose.
+   work later) and `SOURCE:` (canonical URL).
+
+   **Databases** render as schema + a markdown table of rows (property values
+   included, row ids in the last column for follow-up `prop`/`read` calls).
+   Query options, DB targets only:
+
+   ```bash
+   ... read '<db-url>' --filter '상태=진행중' --filter '담당=철진' \
+       --sort '-우선순위' --limit 50
+   ```
+
+   Multiple `--filter` combine as AND (enum/number/checkbox/date match exactly,
+   title/rich_text match contains); `--sort '-이름'` = descending, `created`/
+   `edited` sort by timestamps; `--filter-json <file>` is the escape hatch for
+   anything fancier (or/date-range/relation). Multi-source DBs: pick one with
+   `--source <이름|id>`. **Pages that are DB rows** render their properties
+   (status, assignee, dates...) in a `**속성**` block before the body.
 
 2. **Read the markdown file.** Read `<scratchpad>/notion_page.md`.
 

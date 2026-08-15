@@ -25,16 +25,33 @@ OAuth 앱 자격증명 (팀 관리자가 1회 등록, 사내 채널로 배포):
     ls [url|id]       인자 없음: 접근 가능한 전체를 트리로 출력 (제목+URL)
                       인자 있음: 그 페이지 바로 아래의 하위 페이지/DB 목록
     read <url|id> [--ids]
+         [--filter '이름=값']... [--filter-json f.json] [--sort '[-]이름']...
+         [--limit N] [--source <이름|id>]
                       페이지를 markdown 으로 출력(stdout) + 캐시 저장.
                       --ids 면 블록마다 ⟨타입 id⟩ 표시 - edit/delete/move 대상 특정 +
                       이동 가능 여부 사전 판별용 (이 모드는 캐시 안 씀)
+                      DB 면 스키마 + 행 표 렌더. --filter (여러 개 = and, enum/숫자는
+                      equals, 텍스트는 contains), --sort ('-' 접두 = 내림차순,
+                      created/edited = 시간 정렬), --limit (기본 100), multi-source DB 는
+                      --source 로 소스 선택. 필터/정렬된 부분 뷰는 캐시 안 씀
     edit <block_id> --text '<새 내용>'
                       블록 본문 교체 (allowlist 하위만, 타입 유지)
     delete <block_id> 블록 archive (Notion 휴지통 복구 가능, allowlist 하위만)
     search <query>    공식 /v1/search - 제목만 검색된다(본문 미지원, API 제약)
-    write <parent-url|id> <title> [--file md.md]
+    write <parent-url|id> <title> [--file md.md] [--prop '이름=값']... [--source S]
                       allowlist 하위에만 새 페이지 생성 (markdown → 블록 변환)
                       md 확장 문법: '#> 제목'~'####> 제목' = 토글 헤딩
+                      parent 가 DB 면 행 생성 - --prop 로 속성 지정 (prop --set 과 같은
+                      문자열 규칙), multi-source DB 는 --source 로 소스 선택
+    db-create <parent-url|id> <제목> [--prop '이름:타입[:옵션들]']... | [--json schema.json]
+                      allowlist 하위 페이지에 새 DB 생성. 타입: title/rich_text/number/
+                      checkbox/date/url/email/phone_number/select/multi_select/people/
+                      files (select 계열은 ':옵션1,옵션2' 로 선택지). title 미지정 시
+                      '이름' 자동 추가. status 는 API 생성 불가(UI 전용)
+    db-prop <db-url|id> [--source S]
+                      DB 스키마 조회 (이름 [타입] (선택지))
+    db-prop <db-url|id> --add '이름:타입[:옵션들]' | --rename '기존=새' | --remove '이름'
+                      스키마 변경 (여러 개 조합 가능, allowlist 가드)
     append <url|id> --file md.md | --text '...' | --json blocks.json
                      [--start | --after <block_id>]
                       allowlist 하위 페이지에 블록 추가. 기본 끝, --start 면 맨 위,
@@ -52,8 +69,8 @@ OAuth 앱 자격증명 (팀 관리자가 1회 등록, 사내 채널로 배포):
                         목적지가 DB 면 data_source 자동 해석. DB간 이동 지원.
                       - 블록 → 복제→검증→원본 archive 합성. 내부 파일은 재업로드로 영구화.
                       DB 자체는 이동 불가(API 한계). --after/--start 는 블록 이동 전용
-    sync [limit]      접근 가능한 페이지를 순회하며 캐시 구축 (기본 200장 제한)
-                      본문 grep 은 이 캐시 위에서 rg 로 한다.
+    sync [limit]      접근 가능한 페이지+DB 를 순회하며 캐시 구축 (기본 200장 제한)
+                      본문 grep 은 이 캐시 위에서 rg 로 한다. DB 는 행 표로 캐시됨.
 
 캐시: ~/.claude/notion/cache/<page_id>.md (frontmatter 에 title/url/fetched_at)
 
@@ -71,6 +88,7 @@ import urllib.request
 
 API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
+DS_API_VERSION = "2026-03-11"  # data_sources 계열 + pages/{id}/move 신버전 전용
 CONF_DIR = os.path.expanduser("~/.claude/notion")
 AUTH_FILE = os.path.join(CONF_DIR, "auth.json")
 OAUTH_APP_FILE = os.path.join(CONF_DIR, "oauth_app.json")
@@ -335,18 +353,25 @@ def render_block(b: dict, indent: str, out: list, state: dict):
             render_block(c, child_indent, out, state)
 
 
-def page_to_markdown(pid: str, show_ids: bool = False):
+def page_to_markdown(pid: str, show_ids: bool = False, query: dict = None):
     """(title, url, markdown) 반환. 페이지가 아니면 데이터베이스로 재시도."""
     state = {"fetched": 0, "truncated": False, "ids": show_ids}
     try:
         page = call("GET", f"/pages/{pid}")
     except ApiError as e:
-        if e.code != 404:
+        # DB id 를 /pages 에 주면 400("is a database"), 미공유/없음이면 404 - 둘 다 DB 로 재시도
+        if e.code not in (400, 404):
             raise
-        return database_to_markdown(pid)
+        return database_to_markdown(pid, query)
     title = page_title(page)
     url = page.get("url", "")
     out = []
+    # DB 행이면 속성부터 - 상태/담당자 같은 메타데이터가 본문만큼 중요하다
+    if page.get("parent", {}).get("type") in ("database_id", "data_source_id"):
+        plines = [f"- {n} [{p.get('type')}]: {prop_value_str(p)}"
+                  for n, p in page.get("properties", {}).items() if p.get("type") != "title"]
+        if plines:
+            out.append("**속성**\n" + "\n".join(plines))
     for b in get_children(pid, state):
         render_block(b, "", out, state)
     md = f"# {title}\n\n" + "\n\n".join(out)
@@ -355,17 +380,116 @@ def page_to_markdown(pid: str, show_ids: bool = False):
     return title, url, md
 
 
-def database_to_markdown(dbid: str):
-    db = call("GET", f"/databases/{dbid}")
+def build_filter(schema: dict, expr: str) -> dict:
+    """'이름=값' → query filter 객체. enum/숫자/체크/날짜는 equals, 텍스트는 contains."""
+    if "=" not in expr:
+        sys.exit(f"BAD_FILTER: {expr!r} - '이름=값' 형식 필요")
+    name, value = expr.split("=", 1)
+    name = name.strip()
+    p = schema.get(name)
+    if not p:
+        sys.exit(f"NO_PROP: 필터 속성 {name!r} 없음. 있는 것: {', '.join(schema)}")
+    t = p.get("type")
+    if t in ("select", "status"):
+        cond = {"equals": value}
+    elif t == "multi_select":
+        cond = {"contains": value}
+    elif t == "checkbox":
+        cond = {"equals": value.strip().lower() in ("true", "1", "yes", "y", "on", "체크")}
+    elif t == "number":
+        cond = {"equals": float(value)}
+    elif t == "date":
+        cond = {"equals": value}
+    elif t in ("title", "rich_text", "url", "email", "phone_number"):
+        cond = {"contains": value}
+    else:
+        sys.exit(f"FILTER_UNSUPPORTED: {t} 타입은 --filter 미지원 - --filter-json <파일> 사용")
+    return {"property": name, t: cond}
+
+
+def build_sorts(exprs) -> list:
+    """['이름', '-이름', 'edited'] → sorts 배열. '-' 접두 = 내림차순, created/edited = 시간 정렬."""
+    sorts = []
+    for e in exprs:
+        e = e.strip()
+        direction = "descending" if e.startswith("-") else "ascending"
+        name = e.lstrip("-")
+        if name in ("created", "edited"):
+            sorts.append({"timestamp": "created_time" if name == "created" else "last_edited_time",
+                          "direction": direction})
+        else:
+            sorts.append({"property": name, "direction": direction})
+    return sorts
+
+
+def query_data_source(ds_id: str, body_extra: dict, limit: int):
+    """POST /data_sources/{id}/query 페이지네이션 - limit 행까지 수집. (rows, 더있음) 반환."""
+    rows, cursor = [], None
+    while len(rows) < limit:
+        body = dict(body_extra)
+        body["page_size"] = min(100, limit - len(rows))
+        if cursor:
+            body["start_cursor"] = cursor
+        data = call("POST", f"/data_sources/{ds_id}/query", body, version=DS_API_VERSION)
+        rows += data.get("results", [])
+        if not data.get("has_more"):
+            return rows, False
+        cursor = data.get("next_cursor")
+    return rows, True
+
+
+def rows_to_table(schema: dict, rows) -> list:
+    """행 목록 → markdown 표. 컬럼 = title 먼저, 나머지 스키마 순, 끝에 id."""
+    names = [n for n, p in schema.items() if p.get("type") == "title"] \
+        + [n for n, p in schema.items() if p.get("type") != "title"]
+
+    def esc(s):
+        return s.replace("|", "\\|").replace("\n", " ")
+
+    lines = ["| " + " | ".join(esc(n) for n in names) + " | id |",
+             "|" + "---|" * (len(names) + 1)]
+    for row in rows:
+        props = row.get("properties", {})
+        cells = [esc(prop_value_str(props[n])) if n in props else "" for n in names]
+        lines.append("| " + " | ".join(cells) + f" | {row['id']} |")
+    return lines
+
+
+def database_to_markdown(dbid: str, query: dict = None):
+    """DB → 스키마 + 행 표 markdown. multi-source DB 는 소스별 섹션으로 렌더."""
+    query = query or {}
+    db = call("GET", f"/databases/{dbid}", version=DS_API_VERSION)
     title = rt(db.get("title")) or "(untitled database)"
     url = db.get("url", "")
-    props = ", ".join(f"{k}({v.get('type')})" for k, v in db.get("properties", {}).items())
-    lines = [f"# 🗃️ {title}", f"**properties:** {props}", "", "## Rows (최대 100)"]
-    data = call("POST", f"/databases/{dbid}/query", {"page_size": 100})
-    for row in data.get("results", []):
-        lines.append(f"- {page_title(row)} `(id: {row['id']})` {row.get('url', '')}")
-    if data.get("has_more"):
-        lines.append("- *[더 있음 - 100행 초과]*")
+    lines = [f"# 🗃️ {title}"]
+    sources = db.get("data_sources", [])
+    sel = query.get("source")
+    if sel:
+        sources = [s for s in sources if sel in (s.get("id"), s.get("name"))]
+        if not sources:
+            sys.exit(f"NO_SOURCE: --source {sel!r} 매칭 실패")
+    if not sources:
+        lines.append("*데이터 소스 없음*")
+    limit = query.get("limit") or 100
+    for s in sources:
+        ds = call("GET", f"/data_sources/{s['id']}", version=DS_API_VERSION)
+        schema = ds.get("properties", {})
+        if len(sources) > 1:
+            lines.append(f"\n## data source: {s.get('name')} `(id: {s['id']})`")
+        lines.append("**properties:** " + ", ".join(
+            f"{k}({v.get('type')})" for k, v in schema.items()))
+        body = {}
+        if query.get("filter_json"):
+            body["filter"] = query["filter_json"]
+        elif query.get("filters"):
+            fs = [build_filter(schema, e) for e in query["filters"]]
+            body["filter"] = fs[0] if len(fs) == 1 else {"and": fs}
+        if query.get("sorts"):
+            body["sorts"] = build_sorts(query["sorts"])
+        rows, more = query_data_source(s["id"], body, limit)
+        note = " - 더 있음, --limit 로 확장" if more else ""
+        lines.append(f"\n## Rows ({len(rows)}행{note})")
+        lines += rows_to_table(schema, rows) if rows else ["*조건에 맞는 행 없음*"]
     return title, url, "\n".join(lines)
 
 
@@ -389,7 +513,21 @@ def prop_value_str(p: dict) -> str:
     if t == "relation":
         return f"{len(v)}개 연결"
     if t in ("formula", "rollup"):
-        return f"(읽기전용 {t})"
+        # 계산 결과 값을 그대로 보여준다 - DB 표에서 합계/판정 컬럼이 읽히도록
+        inner_t = v.get("type")
+        inner = v.get(inner_t)
+        if inner_t == "array":
+            return ", ".join(prop_value_str(x) for x in inner) or "(비어있음)"
+        if inner_t == "date" and isinstance(inner, dict):
+            return (inner.get("start") or "") + (f" → {inner['end']}" if inner.get("end") else "")
+        return "(비어있음)" if inner is None else str(inner)
+    if t == "files":
+        return ", ".join(f.get("name", "?") for f in v) or "(비어있음)"
+    if t == "unique_id":
+        prefix = v.get("prefix")
+        return f"{prefix}-{v.get('number')}" if prefix else str(v.get("number"))
+    if t in ("created_by", "last_edited_by"):
+        return v.get("name", "?")
     return str(v)
 
 
@@ -481,11 +619,33 @@ def cmd_whoami():
         print(f"  [{r.get('object')}] {t}  {r.get('url', '')}")
 
 
-def cmd_read(target: str, show_ids: bool = False):
-    pid = to_page_id(target)
-    title, url, md = page_to_markdown(pid, show_ids)
+def parse_query_opts(argv) -> dict:
+    """read 의 DB 조회 옵션 (--filter/--filter-json/--sort/--limit/--source) 파싱."""
+    q = {}
+    fs = [argv[i + 1] for i, a in enumerate(argv) if a == "--filter"]
+    if fs:
+        q["filters"] = fs
+    if "--filter-json" in argv:
+        with open(argv[argv.index("--filter-json") + 1], encoding="utf-8") as f:
+            q["filter_json"] = json.load(f)
+    ss = [argv[i + 1] for i, a in enumerate(argv) if a == "--sort"]
+    if ss:
+        q["sorts"] = ss
+    if "--limit" in argv:
+        q["limit"] = int(argv[argv.index("--limit") + 1])
+    if "--source" in argv:
+        q["source"] = argv[argv.index("--source") + 1]
+    return q
+
+
+def cmd_read(argv):
+    pid = to_page_id(argv[0])
+    show_ids = "--ids" in argv
+    query = parse_query_opts(argv)
+    title, url, md = page_to_markdown(pid, show_ids, query)
     print(md)
-    if not show_ids:  # id 마커가 섞인 출력은 캐시(grep 대상)를 오염시키므로 저장 안 함
+    # id 마커나 필터/정렬된 부분 뷰는 캐시(grep 대상)를 오염시키므로 저장 안 함
+    if not show_ids and not query:
         cache = write_cache(pid, title, url, md)
         print(f"\nCACHED: {cache}", file=sys.stderr)
     print(f"SOURCE: {url}", file=sys.stderr)
@@ -737,17 +897,123 @@ def arg_blocks(argv):
 def cmd_write(argv):
     parent = to_page_id(argv[0])
     title = argv[1]
-    assert_writable(parent)
     blocks = md_to_blocks(read_md_arg(argv)) if ("--file" in argv or "--text" in argv) else []
-    page = call("POST", "/pages", {
-        "parent": {"page_id": parent},
-        "properties": {"title": {"title": [{"type": "text", "text": {"content": title}}]}},
-        "children": blocks[:100]})
+    source_sel = argv[argv.index("--source") + 1] if "--source" in argv else None
+    ds = resolve_data_source(parent, source_sel)
+
+    if ds:  # DB 가 목적지 → 행 생성 (--prop '이름=값' 으로 속성 지정)
+        assert_writable(parent, kind="database")
+        schema = call("GET", f"/data_sources/{ds}", version=DS_API_VERSION).get("properties", {})
+        title_name = next((n for n, p in schema.items() if p.get("type") == "title"), "title")
+        properties = {title_name: {"title": [{"type": "text", "text": {"content": title}}]}}
+        for s in [argv[i + 1] for i, a in enumerate(argv) if a == "--prop"]:
+            if "=" not in s:
+                sys.exit(f"BAD_PROP: {s!r} - '이름=값' 형식 필요")
+            name, value = s.split("=", 1)
+            name = name.strip()
+            if name not in schema:
+                sys.exit(f"NO_PROP: {name!r} 속성 없음. 있는 것: {', '.join(schema)}")
+            ptype = schema[name].get("type")
+            properties[name] = {ptype: build_prop_payload(ptype, value)}
+        page = call("POST", "/pages", {
+            "parent": {"type": "data_source_id", "data_source_id": ds},
+            "properties": properties,
+            "children": blocks[:100]}, version=DS_API_VERSION)
+        label = "CREATED(row)"
+    else:
+        assert_writable(parent)
+        page = call("POST", "/pages", {
+            "parent": {"page_id": parent},
+            "properties": {"title": {"title": [{"type": "text", "text": {"content": title}}]}},
+            "children": blocks[:100]})
+        label = "CREATED"
+
     if len(blocks) > 100:
         append_blocks(page["id"], blocks[100:])
-    print(f"CREATED: {title}")
+    print(f"{label}: {title}")
     print(f"URL: {page.get('url', '')}")
     print(f"id: {page['id']}")
+
+
+DB_PROP_TYPES = {"title", "rich_text", "number", "checkbox", "date", "url", "email",
+                 "phone_number", "select", "multi_select", "people", "files"}
+
+
+def parse_schema_prop(spec: str):
+    """'이름:타입[:옵션1,옵션2]' → (이름, 스키마 조각). 옵션은 select 계열 전용."""
+    parts = spec.split(":", 2)
+    if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
+        sys.exit(f"BAD_SCHEMA: {spec!r} - '이름:타입[:옵션들]' 형식 필요")
+    name, ptype = parts[0].strip(), parts[1].strip()
+    if ptype == "status":
+        sys.exit("SCHEMA_UNSUPPORTED: status 속성은 API 로 생성 불가 (Notion UI 전용) - select 로 대체 권장")
+    if ptype not in DB_PROP_TYPES:
+        sys.exit(f"SCHEMA_UNSUPPORTED: {ptype!r} 타입 미지원. 가능: {', '.join(sorted(DB_PROP_TYPES))}")
+    if ptype in ("select", "multi_select"):
+        options = [{"name": o.strip()} for o in (parts[2].split(",") if len(parts) > 2 else []) if o.strip()]
+        return name, {ptype: {"options": options}}
+    return name, {ptype: {}}
+
+
+def cmd_db_create(argv):
+    parent = to_page_id(argv[0])
+    title = argv[1]
+    assert_writable(parent)
+    if "--json" in argv:
+        with open(argv[argv.index("--json") + 1], encoding="utf-8") as f:
+            props = json.load(f)
+    else:
+        props = {}
+        for spec in [argv[i + 1] for i, a in enumerate(argv) if a == "--prop"]:
+            name, piece = parse_schema_prop(spec)
+            props[name] = piece
+    if not any("title" in p for p in props.values()):
+        props["이름"] = {"title": {}}  # title 속성은 DB 필수 - 미지정 시 기본 생성
+    db = call("POST", "/databases", {
+        "parent": {"type": "page_id", "page_id": parent},
+        "title": [{"type": "text", "text": {"content": title}}],
+        "initial_data_source": {"properties": props}}, version=DS_API_VERSION)
+    ds = (db.get("data_sources") or [{}])[0]
+    print(f"CREATED_DB: {title}")
+    print(f"URL: {db.get('url', '')}")
+    print(f"db id: {db['id']}")
+    print(f"data_source id: {ds.get('id')}")
+
+
+def cmd_db_prop(argv):
+    dbid = to_page_id(argv[0])
+    source_sel = argv[argv.index("--source") + 1] if "--source" in argv else None
+    ds = resolve_data_source(dbid, source_sel)
+    if not ds:
+        sys.exit(f"NOT_DB: {dbid} 는 데이터베이스가 아님")
+
+    payload = {}
+    for spec in [argv[i + 1] for i, a in enumerate(argv) if a == "--add"]:
+        name, piece = parse_schema_prop(spec)
+        payload[name] = piece
+    for spec in [argv[i + 1] for i, a in enumerate(argv) if a == "--rename"]:
+        if "=" not in spec:
+            sys.exit(f"BAD_RENAME: {spec!r} - '기존이름=새이름' 형식 필요")
+        old, new = spec.split("=", 1)
+        payload[old.strip()] = {"name": new.strip()}
+    for i, a in enumerate(argv):
+        if a == "--remove":
+            payload[argv[i + 1].strip()] = None
+
+    if not payload:  # 조회 모드: 스키마 출력
+        schema = call("GET", f"/data_sources/{ds}", version=DS_API_VERSION).get("properties", {})
+        for n, p in schema.items():
+            extra = ""
+            if p.get("type") in ("select", "multi_select", "status"):
+                opts = (p.get(p["type"]) or {}).get("options", [])
+                extra = " (" + ", ".join(o.get("name", "") for o in opts) + ")"
+            print(f"{n} [{p.get('type')}]{extra}")
+        return
+
+    assert_writable(dbid, kind="database")  # 스키마 변경은 쓰기
+    res = call("PATCH", f"/data_sources/{ds}", {"properties": payload}, version=DS_API_VERSION)
+    kept = ", ".join(f"{k}({v.get('type')})" for k, v in (res.get("properties") or {}).items())
+    print(f"DB_PROP_OK: {kept}")
 
 
 # ---------- 파일 업로드 (File Upload API: 생성 → 바이트 전송 2단계) ----------
@@ -913,21 +1179,36 @@ def _copy_children_into(src_parent: str, dest_parent: str, state: dict):
                 _copy_children_into(src["id"], created["id"], state)
 
 
-MOVE_API_VERSION = "2026-03-11"  # pages/{id}/move + data_sources 는 신버전 전용
+def resolve_data_source(dest: str, source_sel: str = None):
+    """dest 가 DB 면 data_source id 반환, 아니면 None.
+
+    multi-source DB(한 DB 에 데이터 소스 여러 개)는 --source <이름|id> 로 골라야 하며,
+    미지정 시 목록을 보여주고 종료한다. write/move/db-prop 이 공유하는 해석기.
+    """
+    try:
+        db = call("GET", f"/databases/{dest}", version=DS_API_VERSION)
+    except ApiError:
+        return None  # DB 아님 → 페이지 취급
+    sources = db.get("data_sources", [])
+    if not sources:
+        return None
+    if source_sel:
+        for s in sources:
+            if source_sel in (s.get("id"), s.get("name")):
+                return s["id"]
+        names = ", ".join(f"{s.get('name')}={s.get('id')}" for s in sources)
+        sys.exit(f"NO_SOURCE: --source {source_sel!r} 매칭 실패. 있는 것: {names}")
+    if len(sources) > 1:
+        names = ", ".join(f"{s.get('name')}={s.get('id')}" for s in sources)
+        sys.exit(f"MULTI_SOURCE_DB: 데이터 소스가 여러 개 - --source <이름|id> 로 지정 필요: {names}")
+    return sources[0]["id"]
 
 
 def resolve_move_parent(dest: str) -> dict:
     """이동 목적지 → parent 객체. DB 면 data_source_id, 아니면 page_id."""
-    try:
-        db = call("GET", f"/databases/{dest}", version=MOVE_API_VERSION)
-        sources = db.get("data_sources", [])
-        if len(sources) > 1:
-            names = ", ".join(f"{s.get('name')}={s.get('id')}" for s in sources)
-            sys.exit(f"MULTI_SOURCE_DB: 데이터 소스가 여러 개 - id 로 직접 지정 필요: {names}")
-        if sources:
-            return {"type": "data_source_id", "data_source_id": sources[0]["id"]}
-    except ApiError:
-        pass  # DB 아님 → 페이지 취급
+    ds = resolve_data_source(dest)
+    if ds:
+        return {"type": "data_source_id", "data_source_id": ds}
     return {"type": "page_id", "page_id": dest}
 
 
@@ -956,7 +1237,7 @@ def cmd_move(argv):
             is_page = False
         if is_page:
             parent = resolve_move_parent(dest)
-            moved = call("POST", f"/pages/{src}/move", {"parent": parent}, version=MOVE_API_VERSION)
+            moved = call("POST", f"/pages/{src}/move", {"parent": parent}, version=DS_API_VERSION)
             kind = "data_source" if parent["type"] == "data_source_id" else "page"
             print(f"MOVED(page): {page_title(moved)} → {kind} {dest} (id 보존, 링크/히스토리 유지)", flush=True)
             continue
@@ -1018,7 +1299,7 @@ def cmd_append(argv):
 def cmd_sync(limit: int):
     n, cursor = 0, None
     while n < limit:
-        body = {"page_size": 100, "filter": {"value": "page", "property": "object"}}
+        body = {"page_size": 100}
         if cursor:
             body["start_cursor"] = cursor
         data = call("POST", "/search", body)
@@ -1026,11 +1307,12 @@ def cmd_sync(limit: int):
             if n >= limit:
                 break
             pid = pg["id"]
+            is_db = pg.get("object") == "database"
             try:
-                title, url, md = page_to_markdown(pid)
+                title, url, md = database_to_markdown(pid) if is_db else page_to_markdown(pid)
                 write_cache(pid, title, url, md)
                 n += 1
-                print(f"[{n}/{limit}] {title}", flush=True)
+                print(f"[{n}/{limit}] {'🗃️ ' if is_db else ''}{title}", flush=True)
             except ApiError as e:
                 print(f"  skip {pid}: HTTP {e.code}", flush=True)
         if not data.get("has_more"):
@@ -1161,7 +1443,7 @@ def main():
         elif cmd == "ls":
             cmd_ls(sys.argv[2:])
         elif cmd == "read":
-            cmd_read(sys.argv[2], "--ids" in sys.argv)
+            cmd_read(sys.argv[2:])
         elif cmd == "edit":
             cmd_edit(sys.argv[2:])
         elif cmd == "delete":
@@ -1174,6 +1456,10 @@ def main():
             cmd_append(sys.argv[2:])
         elif cmd == "prop":
             cmd_prop(sys.argv[2:])
+        elif cmd == "db-create":
+            cmd_db_create(sys.argv[2:])
+        elif cmd == "db-prop":
+            cmd_db_prop(sys.argv[2:])
         elif cmd == "allow":
             cmd_allow(sys.argv[2:])
         elif cmd == "upload":

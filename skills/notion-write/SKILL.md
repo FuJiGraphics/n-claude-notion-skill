@@ -44,6 +44,36 @@ allowlist; only append the id after explicit confirmation.
 
    Prints `CREATED` + the new page's URL and id — give the URL to the user.
 
+## Create a row in a database
+
+Same `write` command — when the parent is a database it creates a row instead,
+with `--prop` setting properties (same string rules as `prop --set`):
+
+```bash
+python3 ~/.claude/skills/notion-read/scripts/notion_api.py \
+  write '<db-url-or-id>' '<행 제목>' \
+  --prop '상태=진행중' --prop '우선순위=2' --prop '마감일=2026-09-01' \
+  [--file body.md]   # 행 본문(카드 안 내용)도 같이 넣을 때
+```
+
+Property names must exist in the DB schema (`NO_PROP` lists what's there —
+check with `db-prop '<db-url>'`). Multi-source DBs need `--source <이름|id>`.
+
+## Create / reshape a database
+
+```bash
+# 새 DB (title 속성 미지정 시 '이름' 자동 추가; select 계열은 :옵션1,옵션2)
+... db-create '<parent-page>' '작업 보드' \
+    --prop '상태:select:대기,진행중,완료' --prop '우선순위:number' --prop '마감일:date'
+
+# 스키마 조회 / 변경
+... db-prop '<db-url>'                              # 이름 [타입] (선택지) 나열
+... db-prop '<db-url>' --add '태그:multi_select:버그,기능' \
+    --rename '마감일=기한' --remove '완료여부'
+```
+
+`status` 타입은 API 로 생성 불가(Notion UI 전용) — select 로 대체.
+
 ## Append to an existing page
 
 ```bash
