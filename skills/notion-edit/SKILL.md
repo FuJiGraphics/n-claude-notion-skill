@@ -1,15 +1,16 @@
 ---
 name: notion-edit
 description: >-
-  Edit or delete specific blocks inside an existing Notion page — the Notion
-  counterpart of the Edit tool. Notion has no string-replace, so the flow is:
-  read the page with block ids, pick the target block, then replace its text
-  or archive it. Writes are HARD-RESTRICTED to pages under the local allowlist
+  Edit, move, duplicate, or delete content inside an existing Notion page —
+  the Notion counterpart of the Edit tool. edit-str does old_str → new_str
+  replacement inside a block; the block-id workflow (read --ids → edit/delete/
+  move) covers everything else, plus page duplicate/archive/restore. Writes
+  are HARD-RESTRICTED to pages under the local allowlist
   (~/.claude/notion/write_allowlist). Use when the user says /notion-edit, or
-  asks to change / fix / update / remove specific content in an existing
-  Notion page ("노션 그 문단 고쳐줘", "그 줄 지워줘", "update that section in
-  Notion"). For adding new content use notion-write instead. Also invocable
-  directly as /notion-edit.
+  asks to change / fix / update / remove / move / duplicate specific content
+  in an existing Notion page ("노션 그 문단 고쳐줘", "그 줄 지워줘", "update
+  that section in Notion"). For adding new content use notion-write instead.
+  Also invocable directly as /notion-edit.
 ---
 
 # Notion Edit
