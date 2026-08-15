@@ -76,7 +76,15 @@ is a feature: you always see exactly what you're about to change.
    This archives — recoverable from Notion's trash — but still confirm with
    the user before deleting anything you didn't create in this session.
 
-4. **Verify**: re-read the page (without `--ids`) and confirm the change took.
+5. **Page-level lifecycle** (same allowlist guard):
+
+   ```bash
+   ... duplicate '<page-id>' [--to '<dest>'] [--title '새 제목']  # 속성+본문 복제
+   ... archive '<page-or-block-id>'    # 휴지통으로
+   ... restore '<page-or-block-id>'    # 휴지통에서 복구
+   ```
+
+6. **Verify**: re-read the page (without `--ids`) and confirm the change took.
 
 ## The allowlist guard
 

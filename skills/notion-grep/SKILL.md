@@ -50,8 +50,10 @@ Offer `/notion-read <url>` for any page the user wants opened.
   python3 ~/.claude/skills/notion-read/scripts/notion_api.py sync 200
   ```
 
-  (Caches up to 200 accessible pages as markdown; takes minutes on big
-  workspaces. Then re-run the rg layer.)
+  (Caches up to 200 accessible pages AND databases as markdown. First run
+  takes minutes on big workspaces; re-runs are incremental — unchanged pages
+  are skipped via last_edited_time, `--full` forces everything. Then re-run
+  the rg layer.)
 
 - Hits with old `fetched_at` may be stale — mention the date; re-read the page
   with `/notion-read` if the user needs current content.
