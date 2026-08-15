@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ~/.claude/skills 에 스킬 3종을 심볼릭 링크로 설치한다.
+# ~/.claude/skills 에 스킬 전체를 심볼릭 링크로 설치한다.
 # 링크 방식이라 레포에서 수정하면 즉시 반영된다. 재실행 안전(idempotent).
 set -euo pipefail
 
