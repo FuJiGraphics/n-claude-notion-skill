@@ -82,8 +82,9 @@ a top-level page covers all its sub-pages).
 - **Signed URLs expire (~1 hour).** Download media right after fetching. On
   `HTTP 403` from the media tool, re-run step 1 for fresh URLs.
 - **Animated GIF** → vision sees only the first frame; describe as a still.
-  **Video** → sampled stills only, never audio. **svg/pdf** → not sampled;
-  mention they exist.
+  **Video** → sampled stills only, never audio. **PDF attachments**
+  (`[pdf: ...]`) → downloaded and listed under `READ THESE`; open them with
+  the Read tool (`pages` param). **svg** → not sampled; mention it exists.
 - **Video needs ffmpeg/ffprobe** (yt-dlp for YouTube/Vimeo embeds). If missing,
   images still work and the tool prints an install hint — never fail the run.
 - **Pages over 3000 blocks are truncated** with an explicit `[TRUNCATED]` marker

@@ -31,9 +31,12 @@ allowlist; only append the id after explicit confirmation.
 ## Create a page
 
 1. Write the content as a markdown file in the scratchpad (supported subset:
-   `#`–`###` headings, `-` bullets, `1.` numbered, `- [ ]`/`- [x]` todos,
-   `>` quotes, ``` fences with language, `---` divider, paragraphs; inline
-   `**bold**`, `` `code` ``, `[text](url)`).
+   `#`–`####` headings, `-` bullets, `1.` numbered — **indent 2 spaces per
+   level to nest**, `- [ ]`/`- [x]` todos, `>` quotes, `> 💡 텍스트` = callout
+   with that icon, `| md | tables |`, ``` fences with language, `---` divider,
+   a bare URL on its own line = bookmark, paragraphs; inline `**bold**`,
+   `*italic*`, `~~strike~~`, `` `code` ``, `[text](url)`. Text over 2000 chars
+   per block is chunked automatically — no silent truncation).
 
 2. Create it under the parent page:
 

@@ -7,6 +7,8 @@ Images arrive as `![caption](https://prod-files-secure.s3...signed-url)` and vid
 context. This script bridges that gap:
 
   * images  -> downloaded locally, ready to Read.
+  * pdfs    -> `[pdf: name](url)` attachments downloaded; the Read tool renders
+               them page by page (pages param), so they land in READ THESE too.
   * videos  -> the model cannot "see" a video at all (vision takes still images only),
                so each video is downloaded and ffmpeg samples evenly-spaced frames plus
                one tiled CONTACT SHEET. Reading the contact sheet shows the whole clip in
@@ -41,6 +43,9 @@ MD_IMAGE_RE = re.compile(r"!\[(?P<caption>[^\]]*)\]\((?P<url>https?://[^\s)]+)\)
 SRC_ATTR_RE = re.compile(r'src="(?P<url>https?://[^"]+)"')
 # <video src="url">caption</video> — Notion's video block.
 VIDEO_RE = re.compile(r'<video[^>]*\ssrc="(?P<url>https?://[^"]+)"')
+# [pdf: name](url) / [file: name](url) — Notion's file/pdf blocks. PDFs are worth
+# downloading: the Read tool renders them page by page (pages param).
+FILE_LINK_RE = re.compile(r"\[(?:pdf|file): (?P<name>[^\]]*)\]\((?P<url>https?://[^\s)]+)\)")
 
 
 def ext_of(url: str) -> str:
@@ -49,9 +54,15 @@ def ext_of(url: str) -> str:
 
 
 def collect(text: str):
-    """Return (images, videos): images=[(url,caption)], videos=[url], de-duplicated, in order."""
+    """Return (images, videos, pdfs): de-duplicated, in order. pdfs=[(url, name)]."""
     seen = set()
-    images, videos = [], []
+    images, videos, pdfs = [], [], []
+
+    for m in FILE_LINK_RE.finditer(text):
+        url = m.group("url")
+        if url not in seen and ext_of(url) == ".pdf":
+            seen.add(url)
+            pdfs.append((url, m.group("name").strip()))
 
     for m in VIDEO_RE.finditer(text):
         url = m.group("url")
@@ -79,7 +90,7 @@ def collect(text: str):
         elif e in VISION_EXTS:
             seen.add(url)
             images.append((url, ""))
-    return images, videos
+    return images, videos, pdfs
 
 
 def download(url: str, dest: str) -> tuple[bool, str]:
@@ -173,10 +184,10 @@ def main():
     with open(page_text_file, "r", encoding="utf-8") as f:
         text = f.read()
     os.makedirs(out_dir, exist_ok=True)
-    images, videos = collect(text)
+    images, videos, pdfs = collect(text)
 
-    if not images and not videos:
-        print("NO_MEDIA: page has no image or video references — nothing to download.")
+    if not images and not videos and not pdfs:
+        print("NO_MEDIA: page has no image, video, or pdf references — nothing to download.")
         return
 
     read_ok = []  # local files the caller should Read
@@ -194,6 +205,17 @@ def main():
                 print(f"  notion_img_{i:02d}{e:<6} NON-VISION (do not Read as image)  {caption or '-'}")
             else:
                 print(f"  notion_img_{i:02d}{e:<6} FAILED: {err}")
+
+    if pdfs:
+        print(f"\nPDFS: {len(pdfs)} found.")
+        for i, (url, name) in enumerate(pdfs, 1):
+            dest = os.path.join(out_dir, f"notion_pdf_{i:02d}.pdf")
+            ok, err = download(url, dest)
+            if ok:
+                read_ok.append(dest)
+                print(f"  notion_pdf_{i:02d}.pdf READ-OK (Read with pages param)  {name or '-'}")
+            else:
+                print(f"  notion_pdf_{i:02d}.pdf FAILED: {err}")
 
     if videos:
         print(f"\nVIDEOS: {len(videos)} found.")

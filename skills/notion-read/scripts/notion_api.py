@@ -871,43 +871,120 @@ def cmd_allow(argv):
     print(f"ALLOWED: {pid} (+하위 전체) {label} 허용. 총 {len(existing) + 1}건")
 
 
-INLINE_RE = re.compile(r"(\*\*.+?\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))")
+# 순서 중요: ** 가 * 보다 먼저 매칭돼야 굵게/기울임이 안 섞인다
+INLINE_RE = re.compile(r"(\*\*.+?\*\*|~~[^~]+~~|`[^`]+`|\[[^\]]+\]\([^)]+\)|\*[^*\n]+\*)")
+
+
+def chunk_text(content: str, annotations: dict = None, link: str = None):
+    """rich_text 항목 하나는 2000자 제한 - 초과분을 여러 객체로 쪼개 무손실 전송."""
+    out = []
+    for i in range(0, len(content), 2000) if content else [0]:
+        t = {"type": "text", "text": {"content": content[i:i + 2000]}}
+        if link:
+            t["text"]["link"] = {"url": link}
+        if annotations:
+            t["annotations"] = annotations
+        out.append(t)
+    return out
 
 
 def md_rich_text(text: str):
-    """markdown 인라인(굵게/코드/링크) → rich_text 배열. 나머지는 평문."""
+    """markdown 인라인(굵게/기울임/취소선/코드/링크) → rich_text 배열. 나머지는 평문."""
     out = []
     for part in INLINE_RE.split(text):
         if not part:
             continue
-        if part.startswith("**") and part.endswith("**"):
-            out.append({"type": "text", "text": {"content": part[2:-2]},
-                        "annotations": {"bold": True}})
-        elif part.startswith("`") and part.endswith("`"):
-            out.append({"type": "text", "text": {"content": part[1:-1]},
-                        "annotations": {"code": True}})
+        if part.startswith("**") and part.endswith("**") and len(part) > 4:
+            out += chunk_text(part[2:-2], {"bold": True})
+        elif part.startswith("~~") and part.endswith("~~") and len(part) > 4:
+            out += chunk_text(part[2:-2], {"strikethrough": True})
+        elif part.startswith("`") and part.endswith("`") and len(part) > 2:
+            out += chunk_text(part[1:-1], {"code": True})
         elif part.startswith("[") and part.endswith(")"):
             m = re.match(r"\[([^\]]+)\]\(([^)]+)\)", part)
-            out.append({"type": "text",
-                        "text": {"content": m.group(1), "link": {"url": m.group(2)}}})
+            out += chunk_text(m.group(1), link=m.group(2))
+        elif part.startswith("*") and part.endswith("*") and len(part) > 2:
+            out += chunk_text(part[1:-1], {"italic": True})
         else:
-            out.append({"type": "text", "text": {"content": part}})
+            out += chunk_text(part)
     return out or [{"type": "text", "text": {"content": ""}}]
+
+
+_EMOJI_RANGES = ((0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2B00, 0x2BFF),
+                 (0x2190, 0x21FF), (0x2700, 0x27FF), (0xFE0F, 0xFE0F))
+
+
+def _leading_emoji(s: str):
+    """문자열이 이모지로 시작하면 (이모지, 나머지) - 콜아웃 왕복용 (`> 💡 텍스트`)."""
+    if not s:
+        return None
+    o = ord(s[0])
+    if not any(a <= o <= b for a, b in _EMOJI_RANGES):
+        return None
+    icon, _, rest = s.partition(" ")
+    return icon, rest
+
+
+def _parse_md_table(lines, i):
+    """연속된 '| ... |' 줄 → table 블록. (블록, 다음 줄 index) 반환.
+
+    table_row 는 생성 시 children 동봉이 필수라 여기서만 인라인 중첩을 쓴다.
+    """
+    rows, has_header = [], False
+    while i < len(lines):
+        s = lines[i].strip()
+        if not (s.startswith("|") and s.endswith("|") and len(s) > 1):
+            break
+        tmp = s[1:-1].replace("\\|", "\x00")  # 이스케이프된 파이프 보호
+        cells = [c.replace("\x00", "|").strip() for c in tmp.split("|")]
+        if all(re.fullmatch(r":?-+:?", c) for c in cells):  # |---|---| 구분행
+            has_header = bool(rows)
+        else:
+            rows.append(cells)
+        i += 1
+    width = max(len(r) for r in rows)
+    trs = [{"type": "table_row", "table_row": {
+        "cells": [md_rich_text(r[j]) if j < len(r) else md_rich_text("") for j in range(width)]}}
+        for r in rows]
+    return {"type": "table", "table": {
+        "table_width": width, "has_column_header": has_header,
+        "has_row_header": False, "children": trs}}, i
+
+
+NESTABLE_TYPES = {"bulleted_list_item", "numbered_list_item", "to_do"}
 
 
 def md_to_blocks(md: str):
     """markdown 서브셋 → Notion 블록 배열.
 
-    지원: heading 1~3, -/1. 리스트, - [ ] 투두, > 인용, ``` 코드펜스, --- 구분선, 문단.
+    지원: heading 1~4 ('#>' = 토글 헤딩), -/1. 리스트(들여쓰기 = 중첩), - [ ] 투두,
+    > 인용, > 이모지 = 콜아웃, | 표 |, ``` 코드펜스, --- 구분선, 단독 URL = 북마크, 문단.
+    리스트 중첩은 블록의 children 으로 들어가고 append 가 레벨 단위로 전송한다.
     """
     blocks, lines, i = [], md.splitlines(), 0
+    stack = []  # [(들여쓰기 레벨, 블록)] - 리스트 중첩 부착용
+
+    def attach(block, level, nestable):
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        if stack:
+            parent = stack[-1][1]
+            parent[parent["type"]].setdefault("children", []).append(block)
+        else:
+            blocks.append(block)
+        if nestable:
+            stack.append((level, block))
+
     while i < len(lines):
         line = lines[i]
         s = line.strip()
         if not s:
             i += 1
             continue
+        indent_level = (len(line) - len(line.lstrip())) // 2
+
         if s.startswith("```"):
+            stack.clear()
             lang = s[3:].strip() or "plain text"
             code = []
             i += 1
@@ -916,11 +993,17 @@ def md_to_blocks(md: str):
                 i += 1
             i += 1  # 닫는 펜스
             blocks.append({"type": "code", "code": {
-                "language": lang,
-                "rich_text": [{"type": "text", "text": {"content": "\n".join(code)[:2000]}}]}})
+                "language": lang, "rich_text": chunk_text("\n".join(code))}})
             continue
+        if s.startswith("|") and s.endswith("|") and len(s) > 1:
+            stack.clear()
+            block, i = _parse_md_table(lines, i)
+            blocks.append(block)
+            continue
+
         m = re.match(r"(#{1,4})(>?)\s+(.*)", s)
         if m:
+            stack.clear()
             lvl = len(m.group(1))
             h = {"rich_text": md_rich_text(m.group(3))}
             if m.group(2):  # '#>' 문법 = 토글 헤딩 (예: '####> 히스토리 확인용')
@@ -928,19 +1011,34 @@ def md_to_blocks(md: str):
             blocks.append({"type": f"heading_{lvl}", f"heading_{lvl}": h})
         elif re.match(r"-\s+\[( |x)\]\s+", s):
             m = re.match(r"-\s+\[( |x)\]\s+(.*)", s)
-            blocks.append({"type": "to_do", "to_do": {
-                "checked": m.group(1) == "x", "rich_text": md_rich_text(m.group(2))}})
+            attach({"type": "to_do", "to_do": {
+                "checked": m.group(1) == "x", "rich_text": md_rich_text(m.group(2))}},
+                indent_level, True)
         elif s.startswith(("- ", "* ")):
-            blocks.append({"type": "bulleted_list_item",
-                           "bulleted_list_item": {"rich_text": md_rich_text(s[2:])}})
+            attach({"type": "bulleted_list_item",
+                    "bulleted_list_item": {"rich_text": md_rich_text(s[2:])}},
+                   indent_level, True)
         elif re.match(r"\d+\.\s+", s):
-            blocks.append({"type": "numbered_list_item",
-                           "numbered_list_item": {"rich_text": md_rich_text(re.sub(r"^\d+\.\s+", "", s))}})
+            attach({"type": "numbered_list_item",
+                    "numbered_list_item": {"rich_text": md_rich_text(re.sub(r"^\d+\.\s+", "", s))}},
+                   indent_level, True)
         elif s.startswith("> "):
-            blocks.append({"type": "quote", "quote": {"rich_text": md_rich_text(s[2:])}})
+            stack.clear()
+            emoji = _leading_emoji(s[2:])
+            if emoji:  # read 가 콜아웃을 '> 💡 텍스트' 로 내보낸 것의 역변환
+                blocks.append({"type": "callout", "callout": {
+                    "icon": {"type": "emoji", "emoji": emoji[0]},
+                    "rich_text": md_rich_text(emoji[1])}})
+            else:
+                blocks.append({"type": "quote", "quote": {"rich_text": md_rich_text(s[2:])}})
         elif s in ("---", "***"):
+            stack.clear()
             blocks.append({"type": "divider", "divider": {}})
+        elif re.fullmatch(r"<https?://[^\s>]+>|https?://\S+", s):
+            stack.clear()
+            blocks.append({"type": "bookmark", "bookmark": {"url": s.strip("<>")}})
         else:
+            stack.clear()
             blocks.append({"type": "paragraph",
                            "paragraph": {"rich_text": md_rich_text(s)}})
         i += 1
@@ -949,13 +1047,26 @@ def md_to_blocks(md: str):
 
 def append_blocks(pid: str, blocks, position=None):
     for i in range(0, len(blocks), 100):  # API 는 요청당 100블록 제한
-        body = {"children": blocks[i:i + 100]}
+        batch, nested = [], []
+        for b in blocks[i:i + 100]:
+            t = b.get("type")
+            kids = None
+            if t not in ("table", "column_list"):  # 표/컬럼은 생성 시 children 동봉이 필수
+                kids = (b.get(t) or {}).pop("children", None)
+            batch.append(b)
+            nested.append(kids)
+        body = {"children": batch}
         if position:
             body["position"] = position
         res = call("PATCH", f"/blocks/{pid}/children", body)
-        if position and res.get("results"):
+        results = res.get("results", [])
+        # 리스트 중첩은 층별 append - 요청당 2단계 중첩 제한을 깊이 무관하게 우회
+        for created, kids in zip(results, nested):
+            if kids:
+                append_blocks(created["id"], kids)
+        if position and results:
             # 위치 지정 시 다음 배치는 방금 배치 꼬리 뒤에 - 호출자가 앵커 체이닝을 몰라도 순서 보존
-            position = {"type": "after_block", "after_block": {"id": res["results"][-1]["id"]}}
+            position = {"type": "after_block", "after_block": {"id": results[-1]["id"]}}
 
 
 def read_md_arg(argv) -> str:
@@ -998,19 +1109,18 @@ def cmd_write(argv):
             properties[name] = {ptype: build_prop_payload(ptype, value)}
         page = call("POST", "/pages", {
             "parent": {"type": "data_source_id", "data_source_id": ds},
-            "properties": properties,
-            "children": blocks[:100]}, version=DS_API_VERSION)
+            "properties": properties}, version=DS_API_VERSION)
         label = "CREATED(row)"
     else:
         assert_writable(parent)
         page = call("POST", "/pages", {
             "parent": {"page_id": parent},
-            "properties": {"title": {"title": [{"type": "text", "text": {"content": title}}]}},
-            "children": blocks[:100]})
+            "properties": {"title": {"title": [{"type": "text", "text": {"content": title}}]}}})
         label = "CREATED"
 
-    if len(blocks) > 100:
-        append_blocks(page["id"], blocks[100:])
+    # 본문은 생성 후 append - 중첩 리스트의 층별 전송 로직을 한 경로로 통일
+    if blocks:
+        append_blocks(page["id"], blocks)
     print(f"{label}: {title}")
     print(f"URL: {page.get('url', '')}")
     print(f"id: {page['id']}")
@@ -1432,7 +1542,7 @@ def cmd_edit(argv):
     b = call("GET", f"/blocks/{bid}")
     t = b.get("type")
     if t == "code":
-        payload = {"code": {"rich_text": [{"type": "text", "text": {"content": new[:2000]}}]}}
+        payload = {"code": {"rich_text": chunk_text(new)}}
     elif t in RICH_TEXT_TYPES:
         payload = {t: {"rich_text": md_rich_text(new)}}
     else:
