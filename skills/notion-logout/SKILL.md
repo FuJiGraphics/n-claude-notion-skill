@@ -29,6 +29,13 @@ Remove stored Notion credentials (and the page cache) from this machine.
    python3 ~/.claude/skills/notion-read/scripts/notion_api.py logout --keep-cache
    ```
 
+   To sign out of **one** workspace only (others and the cache stay; if it
+   was `default`, the next one becomes default):
+
+   ```bash
+   python3 ~/.claude/skills/notion-read/scripts/notion_api.py logout --ws '<workspace name>'
+   ```
+
 2. **Relay the output.** It reports exactly what was removed (`auth.json`,
    legacy `token`, `cache`).
 

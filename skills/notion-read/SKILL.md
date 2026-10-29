@@ -24,7 +24,9 @@ below prints `NO_TOKEN` or `AUTH_FAIL`, tell the user to run `/notion-login` and
 stop.
 If it prints `NO_ACCESS`, the page isn't connected to the integration — tell the
 user to open the page → `⋯` menu → Connections → add the integration (connecting
-a top-level page covers all its sub-pages).
+a top-level page covers all its sub-pages). The message lists the workspaces
+tried; if the page lives in a different workspace, that workspace's token must
+be added first (`/notion-login`, it does not replace existing logins).
 
 ## Workflow
 

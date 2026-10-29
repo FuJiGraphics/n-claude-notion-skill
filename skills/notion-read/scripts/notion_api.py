@@ -5,9 +5,18 @@ MCP 커넥터 없이 OAuth 또는 integration token 으로 동작한다. 대화�
 서브에이전트, cron, 워크플로 어디서든 같은 방식으로 돈다.
 
 인증 (우선순위 순):
-    1. 환경변수 NOTION_TOKEN                          - cron/CI 용
-    2. ~/.claude/notion/auth.json (chmod 600)          - `login` 명령이 저장 (OAuth)
+    1. 환경변수 NOTION_TOKEN                          - cron/CI 용 (단일 토큰, 전환 없음)
+    2. ~/.claude/notion/auth.json (chmod 600)          - `login` 명령이 저장 (OAuth/토큰)
     3. ~/.claude/notion/token                          - 레거시 폴백 (토큰 문자열 1줄)
+
+다중 워크스페이스 (auth.json):
+    {"default": "<이름>", "workspaces": {"<이름>": {"access_token": ..., ...}}}
+    login 은 덮어쓰지 않고 워크스페이스를 추가한다 (같은 이름이면 교체).
+    대상 id 가 있는 명령은 default 로 먼저 요청하고, 404(object_not_found) 면 나머지
+    워크스페이스 토큰으로 재시도한다. 성공한 워크스페이스로 이후 요청을 보낸다.
+    대상 id 가 없는 명령(whoami/search/ls/sync)은 전 워크스페이스를 순회한다.
+    전역 옵션 --ws <이름> 이면 그 워크스페이스로 고정하고 재시도하지 않는다.
+    구버전 auth.json(토큰 1개)은 첫 실행 때 이 형식으로 자동 변환된다.
 
 OAuth 앱 자격증명 (팀 관리자가 1회 등록, 사내 채널로 배포):
     ~/.claude/notion/oauth_app.json
@@ -19,9 +28,12 @@ OAuth 앱 자격증명 (팀 관리자가 1회 등록, 사내 채널로 배포):
     login             OAuth 로그인 - 브라우저 열림, Notion 페이지 피커에서 공유
                       범위 선택, localhost 콜백으로 토큰 수신 후 저장
     login --token T   폴백 - internal integration 토큰을 직접 저장
-    whoami            토큰 검증 + 접근 가능한 페이지 샘플 출력
+                      (둘 다 기존 워크스페이스를 유지하고 추가. 첫 워크스페이스가 default)
+    whoami            워크스페이스별 토큰 검증 + 접근 가능한 페이지 샘플 출력
     logout [--keep-cache]
                       auth.json/token 삭제 + 캐시 삭제(기본). --keep-cache 면 캐시 유지.
+    logout --ws <이름>
+                      그 워크스페이스 토큰만 삭제 (캐시 유지, 지운 게 default 면 다음 것으로)
     ls [url|id]       인자 없음: 접근 가능한 전체를 트리로 출력 (제목+URL)
                       인자 있음: 그 페이지 바로 아래의 하위 페이지/DB 목록
     read <url|id> [--ids]
@@ -140,6 +152,12 @@ def load_json(path):
         return None
 
 
+# 이 프로세스가 요청을 보낼 워크스페이스 이름. None = default. 404 재시도가 성공하면 바뀐다
+_active_ws = None
+# --ws 지정 또는 전 워크스페이스 순회 중이면 True - 404 재시도로 워크스페이스를 바꾸지 않는다
+_ws_pinned = False
+
+
 def save_auth(data: dict):
     os.makedirs(CONF_DIR, exist_ok=True)
     with open(AUTH_FILE, "w") as f:
@@ -147,13 +165,62 @@ def save_auth(data: dict):
     os.chmod(AUTH_FILE, 0o600)
 
 
-def get_token() -> str:
+def fetch_workspace_name(token: str) -> str:
+    """토큰이 속한 워크스페이스 이름 (GET /users/me). auth.json 의 키로 쓴다."""
+    req = urllib.request.Request(API + "/users/me", headers={
+        "Authorization": f"Bearer {token}", "Notion-Version": NOTION_VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            me = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise ApiError(e.code, e.read().decode(errors="replace")[:300])
+    name = (me.get("bot") or {}).get("workspace_name")
+    if not name:
+        sys.exit("NO_WORKSPACE_NAME: /users/me 응답에 bot.workspace_name 없음 - 워크스페이스 판별 불가")
+    return name
+
+
+def load_auth():
+    """auth.json 을 다중 워크스페이스 형식으로 반환. 없으면 None.
+
+    구버전(최상위에 access_token 1개)이면 워크스페이스 이름을 조회해 새 형식으로 변환 후 저장한다.
+    """
+    auth = load_json(AUTH_FILE)
+    if not auth or "workspaces" in auth:
+        return auth
+    if not auth.get("access_token"):
+        return None
+    name = auth.get("workspace_name") or fetch_workspace_name(auth["access_token"])
+    auth = {"default": name, "workspaces": {name: auth}}
+    save_auth(auth)
+    return auth
+
+
+def workspace_names() -> list:
+    """요청 순서(default 먼저)의 워크스페이스 이름 목록.
+
+    NOTION_TOKEN 이나 레거시 token 파일은 이름 없는 단일 토큰이라 [None].
+    """
+    if os.environ.get("NOTION_TOKEN", "").strip():
+        return [None]
+    auth = load_auth()
+    if not auth:
+        return [None]
+    return [auth["default"]] + [n for n in auth["workspaces"] if n != auth["default"]]
+
+
+def get_token(ws=None) -> str:
+    """ws(없으면 현재 워크스페이스, 그것도 없으면 default)의 access_token."""
     t = os.environ.get("NOTION_TOKEN", "").strip()
     if t:
         return t
-    auth = load_json(AUTH_FILE)
-    if auth and auth.get("access_token"):
-        return auth["access_token"]
+    auth = load_auth()
+    if auth:
+        name = ws or _active_ws or auth["default"]
+        entry = auth["workspaces"].get(name)
+        if not entry:
+            sys.exit(f"NO_WORKSPACE: {name!r} 로그인 기록 없음. 있는 것: {', '.join(auth['workspaces'])}")
+        return entry["access_token"]
     try:
         with open(TOKEN_FILE) as f:
             t = f.read().strip()
@@ -183,30 +250,34 @@ def oauth_token_request(app: dict, body: dict) -> dict:
         raise ApiError(e.code, e.read().decode(errors="replace")[:300])
 
 
-def try_refresh() -> bool:
-    """만료/폐기된 access_token 을 refresh_token 으로 갱신 시도."""
-    auth = load_json(AUTH_FILE)
+def try_refresh(ws) -> bool:
+    """ws 의 만료/폐기된 access_token 을 refresh_token 으로 갱신 시도."""
+    if os.environ.get("NOTION_TOKEN", "").strip():
+        return False
+    auth = load_auth()
     app = load_json(OAUTH_APP_FILE)
-    if not auth or not auth.get("refresh_token") or not app:
+    if not auth or not app:
+        return False
+    entry = auth["workspaces"].get(ws or auth["default"])
+    if not entry or not entry.get("refresh_token"):
         return False
     try:
         fresh = oauth_token_request(app, {
             "grant_type": "refresh_token",
-            "refresh_token": auth["refresh_token"]})
+            "refresh_token": entry["refresh_token"]})
     except ApiError:
         return False
-    auth.update(fresh)
+    entry.update(fresh)
     save_auth(auth)
     return True
 
 
-def call(method: str, path: str, body=None, _retried=False, version=None):
-    data = json.dumps(body).encode() if body is not None else None
+def _request(ws, method: str, path: str, data, version, _retried=False):
     for _ in range(6):
         req = urllib.request.Request(
             API + path, data=data, method=method,
             headers={
-                "Authorization": f"Bearer {get_token()}",
+                "Authorization": f"Bearer {get_token(ws)}",
                 # 기본은 구버전 유지(데이터베이스 엔드포인트 호환), 신기능만 개별 오버라이드
                 "Notion-Version": version or NOTION_VERSION,
                 "Content-Type": "application/json",
@@ -218,10 +289,67 @@ def call(method: str, path: str, body=None, _retried=False, version=None):
             if e.code == 429:  # rate limit(약 3req/s) - Retry-After 존중 후 재시도
                 time.sleep(float(e.headers.get("Retry-After", "1")) + 0.2)
                 continue
-            if e.code == 401 and not _retried and try_refresh():
-                return call(method, path, body, _retried=True, version=version)
+            if e.code == 401 and not _retried and try_refresh(ws):
+                return _request(ws, method, path, data, version, _retried=True)
             raise ApiError(e.code, e.read().decode(errors="replace")[:300])
     raise ApiError(429, "rate limit 재시도 초과")
+
+
+def call(method: str, path: str, body=None, version=None):
+    """현재 워크스페이스로 요청. 404 면 다른 워크스페이스 토큰으로 재시도한다.
+
+    integration 은 자기 워크스페이스 밖 객체를 404 로 본다. 재시도가 성공하면 그
+    워크스페이스를 이후 요청의 기본으로 바꾼다 (같은 페이지의 하위 블록 요청이 바로 맞도록).
+    """
+    global _active_ws
+    data = json.dumps(body).encode() if body is not None else None
+    names = workspace_names()
+    first = _active_ws or names[0]
+    try:
+        return _request(first, method, path, data, version)
+    except ApiError as e:
+        if e.code != 404 or _ws_pinned or len(names) < 2:
+            raise
+        for ws in names:
+            if ws == first:
+                continue
+            try:
+                res = _request(ws, method, path, data, version)
+            except ApiError as e2:
+                if e2.code != 404:
+                    print(f"WARN: 워크스페이스 {ws!r} 재시도 실패 ({e2})", file=sys.stderr)
+                continue
+            _active_ws = ws
+            return res
+        raise
+
+
+def each_workspace():
+    """대상 id 가 없는 명령(whoami/search/ls/sync)용 - 워크스페이스를 바꿔 가며 순회.
+
+    search 커서가 워크스페이스 단위라서 순회 중에는 404 재시도로 워크스페이스가 바뀌지 않게 고정한다.
+    --ws 로 고정된 상태면 그 워크스페이스 하나만.
+    """
+    global _active_ws, _ws_pinned
+    if _ws_pinned:
+        yield _active_ws
+        return
+    _ws_pinned = True
+    try:
+        for ws in workspace_names():
+            _active_ws = ws
+            yield ws
+    finally:
+        _active_ws, _ws_pinned = None, False
+
+
+def add_workspace(name: str, entry: dict) -> bool:
+    """워크스페이스 토큰 추가 (같은 이름이면 교체). 첫 워크스페이스가 default. 교체였으면 True."""
+    auth = load_auth() or {"default": name, "workspaces": {}}
+    replaced = name in auth["workspaces"]
+    auth["workspaces"][name] = entry
+    save_auth(auth)
+    return replaced
 
 
 # ---------- id / rich_text ----------
@@ -720,19 +848,24 @@ def cached_edited(pid: str) -> str:
 # ---------- 명령 ----------
 
 def cmd_whoami():
-    me = call("GET", "/users/me")
-    ws = (me.get("bot") or {}).get("workspace_name", "?")
-    print(f"OK: bot \"{me.get('name', '?')}\", workspace \"{ws}\"")
-    sample = call("POST", "/search", {"page_size": 10})
-    results = sample.get("results", [])
-    if not results:
-        print("접근 가능한 페이지 0개 - integration 을 페이지에 연결해야 함"
-              " (페이지 ⋯ → Connections → integration 추가)")
-        return
-    print(f"접근 가능한 페이지 샘플 ({len(results)}개):")
-    for r in results:
-        t = page_title(r) if r.get("object") == "page" else rt(r.get("title"))
-        print(f"  [{r.get('object')}] {t}  {r.get('url', '')}")
+    default = workspace_names()[0]
+    for i, name in enumerate(each_workspace()):
+        if i:
+            print()
+        me = call("GET", "/users/me")
+        ws = (me.get("bot") or {}).get("workspace_name", "?")
+        mark = " (default)" if name is not None and name == default else ""
+        print(f"OK: bot \"{me.get('name', '?')}\", workspace \"{ws}\"{mark}")
+        sample = call("POST", "/search", {"page_size": 10})
+        results = sample.get("results", [])
+        if not results:
+            print("접근 가능한 페이지 0개 - integration 을 페이지에 연결해야 함"
+                  " (페이지 ⋯ → Connections → integration 추가)")
+            continue
+        print(f"접근 가능한 페이지 샘플 ({len(results)}개):")
+        for r in results:
+            t = page_title(r) if r.get("object") == "page" else rt(r.get("title"))
+            print(f"  [{r.get('object')}] {t}  {r.get('url', '')}")
 
 
 def parse_query_opts(argv) -> dict:
@@ -801,19 +934,23 @@ def _cache_body_search(query: str, exclude_ids: set):
 
 
 def cmd_search(query: str):
-    data = call("POST", "/search", {"query": query, "page_size": 25})
-    results = data.get("results", [])
+    results = []
+    for ws in each_workspace():
+        data = call("POST", "/search", {"query": query, "page_size": 25})
+        results += [(ws, r) for r in data.get("results", [])]
+    multi = len({ws for ws, _ in results}) > 1
     if results:
         print(f"== 제목 매칭 ({len(results)}건) ==")
-        for r in results:
+        for ws, r in results:
             t = page_title(r) if r.get("object") == "page" else rt(r.get("title"))
-            print(f"[{r.get('object')}] {t}\n  {r.get('url', '')}\n  id: {r.get('id')}"
+            tag = f"  [{ws}]" if multi else ""
+            print(f"[{r.get('object')}] {t}{tag}\n  {r.get('url', '')}\n  id: {r.get('id')}"
                   f"  edited: {r.get('last_edited_time', '')[:10]}")
     else:
         print(f"제목 매칭 없음: {query!r} (공식 API 는 제목만 검색)")
 
     # 2층: 캐시 본문 - 제목 검색이 못 잡는 본문 언급을 잡는다
-    body_hits = _cache_body_search(query, {r.get("id", "") for r in results})
+    body_hits = _cache_body_search(query, {r.get("id", "") for _, r in results})
     if body_hits is None:
         print("\n본문 검색 불가: 캐시 없음 - `sync` 로 미러 구축 후 재시도")
     elif body_hits:
@@ -851,7 +988,16 @@ def cmd_ls(args, limit=1000):
             print("EMPTY: 하위 페이지/데이터베이스 없음 (본문 블록만 있는 페이지)")
         return
 
-    # 전체 트리: search 로 접근 가능한 모든 page/database 수집 후 parent 로 조립
+    # 전체 트리: 워크스페이스마다 search 로 접근 가능한 page/database 수집 후 parent 로 조립
+    multi = not _ws_pinned and len(workspace_names()) > 1
+    for i, ws in enumerate(each_workspace()):
+        if multi:
+            print(f"{chr(10) if i else ''}== 워크스페이스: {ws} ==")
+        _ls_tree(limit)
+
+
+def _ls_tree(limit):
+    """현재 워크스페이스에서 접근 가능한 page/database 를 parent 로 조립해 트리 출력."""
     items = {}
     cursor = None
     while len(items) < limit:
@@ -1370,11 +1516,12 @@ def cmd_upload(argv):
     with open(path, "rb") as f:
         data = f.read()
     name = os.path.basename(path)
+    pid = to_page_id(argv[argv.index("--attach") + 1]) if "--attach" in argv else None
+    if pid:  # 가드가 대상 워크스페이스를 정한다 - file_upload 는 워크스페이스 단위라 업로드보다 먼저
+        assert_writable(pid)
     fid = upload_bytes(data, name, guess_content_type(name))
     print(f"UPLOADED: {name} → file_upload id {fid}")
-    if "--attach" in argv:  # 이미지/파일 블록으로 즉시 첨부
-        pid = to_page_id(argv[argv.index("--attach") + 1])
-        assert_writable(pid)
+    if pid:  # 이미지/파일 블록으로 즉시 첨부
         btype = "image" if guess_content_type(name).startswith("image/") else "file"
         append_blocks(pid, [{"type": btype, btype: {
             "type": "file_upload", "file_upload": {"id": fid}}}])
@@ -1932,34 +2079,36 @@ def cmd_append(argv):
 
 
 def cmd_sync(limit: int, full: bool = False):
-    n, skipped, cursor = 0, 0, None
-    while n < limit:
-        body = {"page_size": 100}
-        if cursor:
-            body["start_cursor"] = cursor
-        data = call("POST", "/search", body)
-        for pg in data.get("results", []):
-            if n >= limit:
+    n, skipped = 0, 0
+    for _ in each_workspace():  # limit 은 전 워크스페이스 합계
+        cursor = None
+        while n < limit:
+            body = {"page_size": 100}
+            if cursor:
+                body["start_cursor"] = cursor
+            data = call("POST", "/search", body)
+            for pg in data.get("results", []):
+                if n >= limit:
+                    break
+                pid = pg["id"]
+                is_db = pg.get("object") == "database"
+                edited = pg.get("last_edited_time", "")
+                # 증분: 마지막 수정 시각이 캐시와 같으면 본문 재다운로드 생략
+                if not full and edited and cached_edited(to_page_id(pid)) == edited:
+                    n += 1
+                    skipped += 1
+                    continue
+                try:
+                    title, url, md, edited = (database_to_markdown(pid) if is_db
+                                              else page_to_markdown(pid))
+                    write_cache(pid, title, url, md, edited)
+                    n += 1
+                    print(f"[{n}/{limit}] {'🗃️ ' if is_db else ''}{title}", flush=True)
+                except ApiError as e:
+                    print(f"  skip {pid}: HTTP {e.code}", flush=True)
+            if not data.get("has_more"):
                 break
-            pid = pg["id"]
-            is_db = pg.get("object") == "database"
-            edited = pg.get("last_edited_time", "")
-            # 증분: 마지막 수정 시각이 캐시와 같으면 본문 재다운로드 생략
-            if not full and edited and cached_edited(to_page_id(pid)) == edited:
-                n += 1
-                skipped += 1
-                continue
-            try:
-                title, url, md, edited = (database_to_markdown(pid) if is_db
-                                          else page_to_markdown(pid))
-                write_cache(pid, title, url, md, edited)
-                n += 1
-                print(f"[{n}/{limit}] {'🗃️ ' if is_db else ''}{title}", flush=True)
-            except ApiError as e:
-                print(f"  skip {pid}: HTTP {e.code}", flush=True)
-        if not data.get("has_more"):
-            break
-        cursor = data.get("next_cursor")
+            cursor = data.get("next_cursor")
     note = f" (미변경 {skipped}건 생략 - 전체 갱신은 --full)" if skipped else ""
     print(f"SYNCED: {n} pages → {CACHE_DIR}{note}")
 
@@ -1968,9 +2117,7 @@ def cmd_login(argv):
     # 폴백: internal integration 토큰 직접 저장
     if "--token" in argv:
         tok = argv[argv.index("--token") + 1].strip()
-        save_auth({"access_token": tok, "method": "internal"})
-        print("토큰 저장됨. 검증:")
-        cmd_whoami()
+        _finish_login(fetch_workspace_name(tok), {"access_token": tok, "method": "internal"})
         return
 
     app = load_json(OAUTH_APP_FILE)
@@ -2043,14 +2190,34 @@ def cmd_login(argv):
         "code": result["code"],
         "redirect_uri": redirect_uri})
     tokens["method"] = "oauth"
-    save_auth(tokens)
-    ws = tokens.get("workspace_name", "?")
-    print(f"OK: workspace \"{ws}\" 로그인 완료 → {AUTH_FILE}")
+    _finish_login(tokens.get("workspace_name") or fetch_workspace_name(tokens["access_token"]), tokens)
+
+
+def _finish_login(name: str, entry: dict):
+    """토큰 저장 (기존 워크스페이스 유지) 후 그 워크스페이스만 검증 출력."""
+    global _active_ws, _ws_pinned
+    replaced = add_workspace(name, entry)
+    print(f"OK: workspace \"{name}\" 로그인 {'갱신' if replaced else '추가'} → {AUTH_FILE}")
+    print(f"로그인된 워크스페이스: {', '.join(workspace_names())} (default: {workspace_names()[0]})")
     print("접근 범위 확인:")
+    _active_ws, _ws_pinned = name, True
     cmd_whoami()
 
 
 def cmd_logout(keep_cache: bool):
+    if _ws_pinned:  # --ws: 그 워크스페이스 토큰만 삭제, 캐시는 유지
+        auth = load_auth()
+        del auth["workspaces"][_active_ws]
+        if not auth["workspaces"]:
+            os.remove(AUTH_FILE)
+            print(f"LOGOUT: 워크스페이스 {_active_ws!r} 삭제 - 남은 워크스페이스 없음 (auth.json 삭제, 캐시 유지)")
+            return
+        if auth["default"] == _active_ws:
+            auth["default"] = next(iter(auth["workspaces"]))
+        save_auth(auth)
+        print(f"LOGOUT: 워크스페이스 {_active_ws!r} 삭제 (캐시 유지). "
+              f"남은 것: {', '.join(auth['workspaces'])} (default: {auth['default']})")
+        return
     removed = []
     if os.path.exists(AUTH_FILE):
         os.remove(AUTH_FILE)
@@ -2071,12 +2238,31 @@ def cmd_logout(keep_cache: bool):
     print("integration 자체 폐기는 https://www.notion.so/my-integrations 에서 직접.")
 
 
+def _pin_workspace(argv):
+    """전역 옵션 --ws <이름>: 그 워크스페이스로 고정 (404 재시도 없음). argv 에서 제거한다."""
+    global _active_ws, _ws_pinned
+    i = argv.index("--ws")
+    if i + 1 >= len(argv):
+        sys.exit("USAGE: --ws <워크스페이스 이름>")
+    name = argv[i + 1]
+    del argv[i:i + 2]
+    if os.environ.get("NOTION_TOKEN", "").strip():
+        sys.exit("BAD_WS: NOTION_TOKEN 설정 시 --ws 사용 불가 (단일 토큰)")
+    auth = load_auth()
+    if not auth or name not in auth["workspaces"]:
+        have = ", ".join(auth["workspaces"]) if auth else "없음"
+        sys.exit(f"NO_WORKSPACE: {name!r} 로그인 기록 없음. 있는 것: {have}")
+    _active_ws, _ws_pinned = name, True
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(2)
-    cmd = sys.argv[1]
     try:
+        if "--ws" in sys.argv:  # 명령 앞뒤 어디에 와도 되도록 명령 판별 전에 걷어낸다
+            _pin_workspace(sys.argv)
+        cmd = sys.argv[1] if len(sys.argv) > 1 else ""
         if cmd == "whoami":
             cmd_whoami()
         elif cmd == "login":
@@ -2135,8 +2321,11 @@ def main():
         if e.code == 401:
             sys.exit(f"AUTH_FAIL: 토큰이 유효하지 않음 ({e}). /notion-login 으로 재로그인.")
         if e.code in (403, 404):
-            sys.exit(f"NO_ACCESS: 페이지에 integration 이 연결되지 않았거나 없음 ({e}).\n"
-                     "페이지 ⋯ 메뉴 → Connections → integration 추가 후 재시도.")
+            names = [n for n in workspace_names() if n]
+            where = f" (확인한 워크스페이스: {', '.join(names)})" if names else ""
+            sys.exit(f"NO_ACCESS: 페이지에 integration 이 연결되지 않았거나 없음{where} ({e}).\n"
+                     "페이지 ⋯ 메뉴 → Connections → integration 추가 후 재시도.\n"
+                     "다른 워크스페이스 페이지면: login --token <그 워크스페이스 토큰> 으로 추가.")
         sys.exit(str(e))
 
 

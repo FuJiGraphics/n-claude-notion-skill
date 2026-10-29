@@ -24,8 +24,10 @@ Authenticate the notion skill suite. Engine:
    python3 ~/.claude/skills/notion-read/scripts/notion_api.py whoami
    ```
 
-   `OK: bot ...` → already logged in. Show workspace + accessible pages, ask if
-   the user wants to re-login (e.g., to share more pages); if not, done.
+   `OK: bot ...` → already logged in (one block per logged-in workspace,
+   `(default)` marks the one tried first). Show workspace + accessible pages,
+   ask if the user wants to re-login (e.g., to share more pages) or add
+   another workspace; if not, done.
 
 2. **Run the OAuth login.**
 
@@ -75,16 +77,27 @@ Authenticate the notion skill suite. Engine:
 
      or set `NOTION_TOKEN` env var (overrides everything, stores nothing).
 
-4. **Explain access scope when relevant**: the integration sees only pages the
+4. **Multiple workspaces.** Login never overwrites another workspace: each
+   `login` / `login --token` adds (or refreshes, if the name matches) one
+   workspace entry in `auth.json`; the first one stays `default`. A page in a
+   workspace whose integration is not connected comes back as `NO_ACCESS`
+   naming the workspaces tried; add that workspace's token with
+   `login --token`. Reads/writes need no workspace flag: the engine tries
+   `default` first and retries the others on 404. `--ws <name>` pins one
+   workspace (useful for `users`, `search`, `ls`, `sync`, which otherwise
+   cover every workspace).
+
+5. **Explain access scope when relevant**: the integration sees only pages the
    user shared in the picker (plus their sub-pages). To widen access later,
    re-run `/notion-login` and pick more pages, or use the page's `⋯` →
    Connections menu.
 
 ## Notes
 
-- Tokens: `~/.claude/notion/auth.json`, chmod 600, never in any repo. When
+- Tokens: `~/.claude/notion/auth.json` (`{"default", "workspaces": {name: {...}}}`;
+  an old single-token file is converted on first run), chmod 600, never in any repo. When
   confirming, show at most the first 8 chars of any token.
 - Access tokens don't expire on a schedule; the script auto-refreshes via
   `refresh_token` on 401 anyway. If refresh fails, the user revoked the
   connection — re-run login.
-- Full sign-out is `/notion-logout`.
+- Full sign-out is `/notion-logout` (`logout --ws <name>` removes one workspace).

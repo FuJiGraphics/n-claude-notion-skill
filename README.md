@@ -161,6 +161,10 @@ legacy `token` file.
   tokens auto-refresh on expiry.
 - **Internal token (personal, instant)**: create at notion.so/my-integrations,
   then `login --token <ntn_...>`. Connect pages via the page `⋯` menu.
+- **Several workspaces**: each login adds a workspace instead of replacing
+  the previous one. Commands with a target id try the default workspace first
+  and retry the others on 404; `whoami`/`search`/`ls`/`sync` cover every
+  workspace. `--ws <name>` pins one, `logout --ws <name>` removes one.
 
 All secrets live in `~/.claude/notion/` (chmod 600), never in any repo.
 
