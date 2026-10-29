@@ -93,9 +93,16 @@ python3 ~/.claude/skills/notion-read/scripts/notion_api.py \
 - **Images**: upload separately after creating the page —
   `upload <local-path> --attach <page-id>` (File Upload API, permanent
   hosting). Image markdown inside content files is NOT converted; keep it out.
-- **Toggle headings** (팀 관례 "히스토리 확인용" 같은 접힌 섹션): `#>` ~
-  `####>` heading syntax marks it toggleable. Raw block JSON escape hatch:
-  `append <page> --json blocks.json`.
+- **Toggles** (팀 관례 "히스토리 확인용" 같은 접힌 섹션): `#>` ~ `####>`
+  (or read's own `### ▸ 제목`) = toggle heading, `- ▸ 텍스트` = plain toggle.
+  Lines indented 2 more spaces below either go **inside** it (paragraphs,
+  lists, code, tables all nest); an unindented line closes it. This is the
+  same shape `read` prints, so read output can be written back as-is. Raw
+  block JSON escape hatch: `append <page> --json blocks.json`.
+- **Code fence languages** must be Notion names; common short forms
+  (`cs`, `js`, `ts`, `py`, `sh`, `yml`, `cpp`...) are mapped automatically.
+- A failed body append archives the just-created page (`ROLLBACK:`), so no
+  empty page is left behind.
 - Needs the integration to have **Insert content** capability; a 403 with a
   permissions message means the user must enable it at
   notion.so/my-integrations.

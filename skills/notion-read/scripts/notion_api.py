@@ -61,7 +61,8 @@ OAuth 앱 자격증명 (팀 관리자가 1회 등록, 사내 채널로 배포):
                       블록 하나 안의 문자열만 가능 (Notion 구조 제약)
     write <parent-url|id> <title> [--file md.md] [--prop '이름=값']... [--source S]
                       allowlist 하위에만 새 페이지 생성 (markdown → 블록 변환)
-                      md 확장 문법: '#> 제목'~'####> 제목' = 토글 헤딩
+                      md 확장 문법: '#> 제목'~'####> 제목'(또는 '# ▸ 제목') = 토글 헤딩,
+                      '- ▸ 텍스트' = 토글. 그 아래 2칸 더 들여쓴 줄 = 토글 안 내용
                       parent 가 DB 면 행 생성 - --prop 로 속성 지정 (prop --set 과 같은
                       문자열 규칙), multi-source DB 는 --source 로 소스 선택
     db-create <parent-url|id> <제목> [--prop '이름:타입[:옵션들]']... | [--json schema.json]
@@ -527,7 +528,8 @@ def render_block(b: dict, indent: str, out: list, state: dict):
         out.append(indent + line.replace("\n", "\n" + indent) if indent else line)
 
     if has_children:
-        child_indent = indent + ("  " if t in LIST_TYPES else "")
+        nested = t in LIST_TYPES or (t.startswith("heading_") and d.get("is_toggleable"))
+        child_indent = indent + ("  " if nested else "")
         for c in get_children(b["id"], state):
             render_block(c, child_indent, out, state)
 
@@ -1203,18 +1205,22 @@ def _parse_md_table(lines, i):
         "has_row_header": False, "children": trs}}, i
 
 
-NESTABLE_TYPES = {"bulleted_list_item", "numbered_list_item", "to_do"}
+# 코드펜스에 흔히 쓰는 약어 → Notion code.language 값 (Notion 은 정해진 이름만 받는다, 그 외는 그대로 전달)
+CODE_LANG_ALIASES = {"cs": "c#", "csharp": "c#", "cpp": "c++", "js": "javascript",
+                     "ts": "typescript", "py": "python", "sh": "shell", "zsh": "shell",
+                     "yml": "yaml", "md": "markdown", "kt": "kotlin", "rb": "ruby"}
 
 
 def md_to_blocks(md: str):
     """markdown 서브셋 → Notion 블록 배열.
 
-    지원: heading 1~4 ('#>' = 토글 헤딩), -/1. 리스트(들여쓰기 = 중첩), - [ ] 투두,
+    지원: heading 1~4 ('#>' 또는 '# ▸' = 토글 헤딩), -/1. 리스트, - [ ] 투두, - ▸ 토글,
     > 인용, > 이모지 = 콜아웃, | 표 |, ``` 코드펜스, --- 구분선, 단독 URL = 북마크, 문단.
-    리스트 중첩은 블록의 children 으로 들어가고 append 가 레벨 단위로 전송한다.
+    리스트, 투두, 토글, 토글 헤딩 아래에 2칸 더 들여쓴 줄은 그 블록의 children 이 된다
+    (read 출력과 같은 형식). append 가 레벨 단위로 전송한다.
     """
     blocks, lines, i = [], md.splitlines(), 0
-    stack = []  # [(들여쓰기 레벨, 블록)] - 리스트 중첩 부착용
+    stack = []  # [(들여쓰기 레벨, 블록)] - 중첩 부착용
 
     def attach(block, level, nestable):
         while stack and stack[-1][0] >= level:
@@ -1233,39 +1239,45 @@ def md_to_blocks(md: str):
         if not s:
             i += 1
             continue
-        indent_level = (len(line) - len(line.lstrip())) // 2
+        lead = len(line) - len(line.lstrip())
+        indent_level = lead // 2
 
         if s.startswith("```"):
-            stack.clear()
-            lang = s[3:].strip() or "plain text"
+            lang = s[3:].strip().lower() or "plain text"
+            lang = CODE_LANG_ALIASES.get(lang, lang)
             code = []
             i += 1
             while i < len(lines) and not lines[i].strip().startswith("```"):
-                code.append(lines[i])
+                # 펜스와 같은 깊이의 들여쓰기는 중첩 표시라 코드 내용에서 뺀다
+                c = lines[i]
+                code.append(c[lead:] if c[:lead].strip() == "" else c.lstrip())
                 i += 1
             i += 1  # 닫는 펜스
-            blocks.append({"type": "code", "code": {
-                "language": lang, "rich_text": chunk_text("\n".join(code))}})
+            attach({"type": "code", "code": {
+                "language": lang, "rich_text": chunk_text("\n".join(code))}}, indent_level, False)
             continue
         if s.startswith("|") and s.endswith("|") and len(s) > 1:
-            stack.clear()
             block, i = _parse_md_table(lines, i)
-            blocks.append(block)
+            attach(block, indent_level, False)
             continue
 
-        m = re.match(r"(#{1,4})(>?)\s+(.*)", s)
+        m = re.match(r"(#{1,4})(>?)\s+(▸\s+)?(.*)", s)
         if m:
-            stack.clear()
             lvl = len(m.group(1))
-            h = {"rich_text": md_rich_text(m.group(3))}
-            if m.group(2):  # '#>' 문법 = 토글 헤딩 (예: '####> 히스토리 확인용')
+            h = {"rich_text": md_rich_text(m.group(4))}
+            # '#>' 문법 또는 read 출력 형식 '# ▸ 제목' = 토글 헤딩 (안쪽 내용은 2칸 들여쓰기)
+            toggleable = bool(m.group(2) or m.group(3))
+            if toggleable:
                 h["is_toggleable"] = True
-            blocks.append({"type": f"heading_{lvl}", f"heading_{lvl}": h})
+            attach({"type": f"heading_{lvl}", f"heading_{lvl}": h}, indent_level, toggleable)
         elif re.match(r"-\s+\[( |x)\]\s+", s):
             m = re.match(r"-\s+\[( |x)\]\s+(.*)", s)
             attach({"type": "to_do", "to_do": {
                 "checked": m.group(1) == "x", "rich_text": md_rich_text(m.group(2))}},
                 indent_level, True)
+        elif re.match(r"[-*]\s+▸\s+", s):  # read 가 토글 블록을 '- ▸ 텍스트' 로 내보낸 것의 역변환
+            attach({"type": "toggle", "toggle": {
+                "rich_text": md_rich_text(re.sub(r"^[-*]\s+▸\s+", "", s))}}, indent_level, True)
         elif s.startswith(("- ", "* ")):
             attach({"type": "bulleted_list_item",
                     "bulleted_list_item": {"rich_text": md_rich_text(s[2:])}},
@@ -1275,24 +1287,21 @@ def md_to_blocks(md: str):
                     "numbered_list_item": {"rich_text": md_rich_text(re.sub(r"^\d+\.\s+", "", s))}},
                    indent_level, True)
         elif s.startswith("> "):
-            stack.clear()
             emoji = _leading_emoji(s[2:])
             if emoji:  # read 가 콜아웃을 '> 💡 텍스트' 로 내보낸 것의 역변환
-                blocks.append({"type": "callout", "callout": {
+                attach({"type": "callout", "callout": {
                     "icon": {"type": "emoji", "emoji": emoji[0]},
-                    "rich_text": md_rich_text(emoji[1])}})
+                    "rich_text": md_rich_text(emoji[1])}}, indent_level, False)
             else:
-                blocks.append({"type": "quote", "quote": {"rich_text": md_rich_text(s[2:])}})
+                attach({"type": "quote", "quote": {"rich_text": md_rich_text(s[2:])}},
+                       indent_level, False)
         elif s in ("---", "***"):
-            stack.clear()
-            blocks.append({"type": "divider", "divider": {}})
+            attach({"type": "divider", "divider": {}}, indent_level, False)
         elif re.fullmatch(r"<https?://[^\s>]+>|https?://\S+", s):
-            stack.clear()
-            blocks.append({"type": "bookmark", "bookmark": {"url": s.strip("<>")}})
+            attach({"type": "bookmark", "bookmark": {"url": s.strip("<>")}}, indent_level, False)
         else:
-            stack.clear()
-            blocks.append({"type": "paragraph",
-                           "paragraph": {"rich_text": md_rich_text(s)}})
+            attach({"type": "paragraph",
+                    "paragraph": {"rich_text": md_rich_text(s)}}, indent_level, False)
         i += 1
     return blocks
 
@@ -1378,7 +1387,15 @@ def cmd_write(argv):
 
     # 본문은 생성 후 append - 중첩 리스트의 층별 전송 로직을 한 경로로 통일
     if blocks:
-        append_blocks(page["id"], blocks)
+        try:
+            append_blocks(page["id"], blocks)
+        except BaseException:  # 본문 실패 시 빈 페이지 잔존 방지 - duplicate 와 같은 자동 롤백
+            try:
+                call("PATCH", f"/pages/{page['id']}", {"archived": True})
+                print(f"ROLLBACK: 본문 추가 실패 - 생성했던 페이지 archive ⟨{page['id']}⟩", file=sys.stderr)
+            except ApiError:
+                print(f"ROLLBACK_FAIL: 실패 잔존물 수동 정리 필요 ⟨{page['id']}⟩", file=sys.stderr)
+            raise
     print(f"{label}: {title}")
     print(f"URL: {page.get('url', '')}")
     print(f"id: {page['id']}")

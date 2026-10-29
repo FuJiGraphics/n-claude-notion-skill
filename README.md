@@ -140,7 +140,8 @@ notion_api.py allow --comment '<team-spec-url>'   # comments only
 
 ## Markdown support
 
-Headings 1-4 (`#>` = toggle heading), lists (2-space indent nests, unlimited
+Headings 1-4 (`#>` or `# ▸` = toggle heading), `- ▸` toggles (2-space indented
+lines below a toggle or toggle heading go inside it), lists (2-space indent nests, unlimited
 depth), `- [ ]` todos, `| md | tables |`, `>` quotes, `> 💡 text` = callout,
 code fences, `---` dividers, a bare URL line = bookmark, inline
 bold/italic/strikethrough/code/links.
